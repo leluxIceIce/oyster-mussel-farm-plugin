@@ -1,0 +1,844 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://musselflow.local/schema/case.json",
+  "title": "MusselFlow ecological screening case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "case_id",
+    "model_role",
+    "units",
+    "forcing",
+    "site",
+    "species",
+    "stocking",
+    "structure",
+    "hydrodynamics",
+    "sediment",
+    "harvest",
+    "constraints",
+    "objective",
+    "validation",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_role": {
+      "const": "UNVALIDATED_LAYOUT_SCREENING"
+    },
+    "units": {
+      "$ref": "#/$defs/units"
+    },
+    "forcing": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/timeline"
+        },
+        {
+          "$ref": "#/$defs/ensemble"
+        }
+      ]
+    },
+    "site": {
+      "$ref": "#/$defs/site"
+    },
+    "food": {
+      "$ref": "#/$defs/food"
+    },
+    "species": {
+      "$ref": "#/$defs/species"
+    },
+    "stocking": {
+      "$ref": "#/$defs/stocking"
+    },
+    "structure": {
+      "$ref": "#/$defs/structure"
+    },
+    "hydrodynamics": {
+      "$ref": "#/$defs/hydrodynamics"
+    },
+    "sediment": {
+      "$ref": "#/$defs/sediment"
+    },
+    "harvest": {
+      "$ref": "#/$defs/harvest"
+    },
+    "constraints": {
+      "$ref": "#/$defs/constraints"
+    },
+    "objective": {
+      "$ref": "#/$defs/objective"
+    },
+    "validation": {
+      "$ref": "#/$defs/validation"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    }
+  },
+  "$defs": {
+    "nonNegative": {
+      "type": "number",
+      "minimum": 0
+    },
+    "positive": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "fraction": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "nullableNonNegative": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "units": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "geometry",
+        "flow_vector_length",
+        "duration",
+        "temperature",
+        "salinity",
+        "dissolved_oxygen",
+        "chlorophyll_a",
+        "suspended_particulate_matter"
+      ],
+      "properties": {
+        "geometry": {
+          "type": "string",
+          "minLength": 1
+        },
+        "flow_vector_length": {
+          "const": "m/s"
+        },
+        "duration": {
+          "const": "h"
+        },
+        "temperature": {
+          "const": "degC"
+        },
+        "salinity": {
+          "const": "PSU"
+        },
+        "dissolved_oxygen": {
+          "const": "mg/L"
+        },
+        "chlorophyll_a": {
+          "const": "ug/L"
+        },
+        "suspended_particulate_matter": {
+          "const": "mg/L"
+        }
+      }
+    },
+    "boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "temperature_c",
+        "salinity_psu",
+        "dissolved_oxygen_mg_l",
+        "chlorophyll_a_ug_l",
+        "tsm_mg_l"
+      ],
+      "properties": {
+        "temperature_c": {
+          "type": "number",
+          "minimum": -2,
+          "maximum": 40
+        },
+        "salinity_psu": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 42
+        },
+        "dissolved_oxygen_mg_l": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "chlorophyll_a_ug_l": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "tsm_mg_l": {
+          "$ref": "#/$defs/nonNegative"
+        }
+      }
+    },
+    "timelineStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "order",
+        "flow_vector_index",
+        "duration_h",
+        "boundary"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "order": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "flow_vector_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duration_h": {
+          "$ref": "#/$defs/positive"
+        },
+        "boundary": {
+          "$ref": "#/$defs/boundary"
+        }
+      }
+    },
+    "timeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "vector_source",
+        "steps",
+        "repeat_count"
+      ],
+      "properties": {
+        "mode": {
+          "const": "timeline"
+        },
+        "vector_source": {
+          "const": "Grasshopper.flowVectors"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/timelineStep"
+          }
+        },
+        "repeat_count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "ensembleState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "flow_vector_index",
+        "occurrence_probability",
+        "duration_h",
+        "boundary"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "flow_vector_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "occurrence_probability": {
+          "$ref": "#/$defs/fraction"
+        },
+        "duration_h": {
+          "$ref": "#/$defs/positive"
+        },
+        "boundary": {
+          "$ref": "#/$defs/boundary"
+        }
+      }
+    },
+    "ensemble": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "vector_source",
+        "states"
+      ],
+      "properties": {
+        "mode": {
+          "const": "ensemble"
+        },
+        "vector_source": {
+          "const": "Grasshopper.flowVectors"
+        },
+        "states": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/ensembleState"
+          }
+        }
+      }
+    },
+    "site": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "depth_m",
+        "initial_dissolved_oxygen_mg_l",
+        "particulate_organic_fraction",
+        "background_sediment_oxygen_demand_g_o2_m2_day",
+        "pelagic_respiration_g_o2_m3_day",
+        "primary_production_g_o2_m3_day",
+        "reaeration_per_day",
+        "vertical_exchange_per_day",
+        "advective_exchange_efficiency"
+      ],
+      "properties": {
+        "depth_m": {
+          "$ref": "#/$defs/positive"
+        },
+        "initial_dissolved_oxygen_mg_l": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "particulate_organic_fraction": {
+          "$ref": "#/$defs/fraction"
+        },
+        "background_sediment_oxygen_demand_g_o2_m2_day": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "pelagic_respiration_g_o2_m3_day": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "primary_production_g_o2_m3_day": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "reaeration_per_day": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "vertical_exchange_per_day": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "advective_exchange_efficiency": {
+          "$ref": "#/$defs/fraction"
+        }
+      }
+    },
+    "allometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mass_exponent",
+        "reference_temperature_c",
+        "q10"
+      ],
+      "properties": {
+        "a_l_h": {
+          "$ref": "#/$defs/positive"
+        },
+        "a_ml_o2_h": {
+          "$ref": "#/$defs/positive"
+        },
+        "mass_exponent": {
+          "$ref": "#/$defs/positive"
+        },
+        "reference_temperature_c": {
+          "type": "number"
+        },
+        "q10": {
+          "$ref": "#/$defs/positive"
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "a_l_h"
+          ],
+          "not": {
+            "required": [
+              "a_ml_o2_h"
+            ]
+          }
+        },
+        {
+          "required": [
+            "a_ml_o2_h"
+          ],
+          "not": {
+            "required": [
+              "a_l_h"
+            ]
+          }
+        }
+      ]
+    },
+    "food": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "carbon_to_chlorophyll_mg_c_per_mg_chl",
+        "organic_carbon_fraction",
+        "small_particle_fraction",
+        "small_particle_diameter_um",
+        "large_particle_diameter_um",
+        "detritus_fraction_of_organic",
+        "detritus_preference",
+        "detritus_assimilation_multiplier",
+        "organic_energy_kj_g"
+      ],
+      "properties": {
+        "carbon_to_chlorophyll_mg_c_per_mg_chl": {"$ref": "#/$defs/positive"},
+        "organic_carbon_fraction": {"$ref": "#/$defs/fraction"},
+        "small_particle_fraction": {"$ref": "#/$defs/fraction"},
+        "small_particle_diameter_um": {"$ref": "#/$defs/positive"},
+        "large_particle_diameter_um": {"$ref": "#/$defs/positive"},
+        "detritus_fraction_of_organic": {"$ref": "#/$defs/fraction"},
+        "detritus_preference": {"$ref": "#/$defs/fraction"},
+        "detritus_assimilation_multiplier": {"$ref": "#/$defs/fraction"},
+        "organic_energy_kj_g": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "salinityActivity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "zero_low",
+        "full_low",
+        "full_high",
+        "zero_high"
+      ],
+      "properties": {
+        "zero_low": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "full_low": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "full_high": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "zero_high": {
+          "$ref": "#/$defs/nonNegative"
+        }
+      }
+    },
+    "species": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "taxon",
+        "profile_status",
+        "mean_dry_tissue_g",
+        "size_cv",
+        "clearance",
+        "respiration",
+        "retention_efficiency",
+        "particulate_retention_efficiency",
+        "assimilation_efficiency",
+        "pseudofaeces_fraction",
+        "activity_fraction",
+        "ammonia_mg_n_g_dw_h",
+        "low_food_threshold_ug_l",
+        "low_food_transition_ug_l",
+        "valid_flow_max_m_s",
+        "salinity_activity_psu"
+      ],
+      "properties": {
+        "taxon": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ammonia_mg_n_g_dw_h": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "low_food_threshold_ug_l": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "low_food_transition_ug_l": {
+          "$ref": "#/$defs/positive"
+        },
+        "retention_d50_um": {"$ref": "#/$defs/positive"},
+        "retention_slope_um": {"$ref": "#/$defs/positive"},
+        "ingestion_half_saturation_ug_l": {"$ref": "#/$defs/positive"},
+        "high_food_assimilation_threshold_ug_l": {"$ref": "#/$defs/nonNegative"},
+        "high_food_assimilation_decay_ug_l": {"$ref": "#/$defs/positive"},
+        "assimilation_quality_half_saturation": {"$ref": "#/$defs/fraction"},
+        "assimilation_reference_organic_fraction": {"$ref": "#/$defs/fraction"},
+        "pseudofaeces_tsm_threshold_mg_l": {"$ref": "#/$defs/nonNegative"},
+        "pseudofaeces_tsm_transition_mg_l": {"$ref": "#/$defs/positive"},
+        "pseudofaeces_max_fraction": {"$ref": "#/$defs/fraction"},
+        "oxygen_zero_saturation_fraction": {"$ref": "#/$defs/fraction"},
+        "oxygen_full_saturation_fraction": {"$ref": "#/$defs/fraction"},
+        "current_clearance_start_m_s": {"$ref": "#/$defs/nonNegative"},
+        "current_clearance_zero_m_s": {"$ref": "#/$defs/positive"},
+        "current_protection_group_size": {"$ref": "#/$defs/positive"},
+        "oxycalorific_kj_per_ml_o2": {"$ref": "#/$defs/positive"},
+        "tissue_energy_kj_g_dw": {"$ref": "#/$defs/positive"},
+        "valid_flow_max_m_s": {
+          "$ref": "#/$defs/positive"
+        },
+        "profile_status": {
+          "const": "screening_prior"
+        },
+        "mean_dry_tissue_g": {
+          "$ref": "#/$defs/positive"
+        },
+        "size_cv": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "clearance": {
+          "$ref": "#/$defs/allometry"
+        },
+        "respiration": {
+          "$ref": "#/$defs/allometry"
+        },
+        "retention_efficiency": {
+          "$ref": "#/$defs/fraction"
+        },
+        "particulate_retention_efficiency": {
+          "$ref": "#/$defs/fraction"
+        },
+        "assimilation_efficiency": {
+          "$ref": "#/$defs/fraction"
+        },
+        "pseudofaeces_fraction": {
+          "$ref": "#/$defs/fraction"
+        },
+        "activity_fraction": {
+          "$ref": "#/$defs/fraction"
+        },
+        "salinity_activity_psu": {
+          "$ref": "#/$defs/salinityActivity"
+        }
+      }
+    },
+    "scalarOrArray": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/nonNegative"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/nonNegative"
+          }
+        }
+      ]
+    },
+    "fractionOrArray": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/fraction"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/fraction"
+          }
+        }
+      ]
+    },
+    "stocking": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "mussels_per_obstacle",
+        "live_wet_g_per_individual",
+        "annual_mortality_fraction"
+      ],
+      "properties": {
+        "mode": {
+          "const": "animals"
+        },
+        "mussels_per_obstacle": {
+          "$ref": "#/$defs/scalarOrArray"
+        },
+        "live_wet_g_per_individual": {
+          "$ref": "#/$defs/positive"
+        },
+        "annual_mortality_fraction": {
+          "$ref": "#/$defs/fraction"
+        },
+        "effective_aggregation_size": {
+          "$ref": "#/$defs/positive"
+        }
+      }
+    },
+    "structure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "porosity_per_obstacle",
+        "twine_diameter_m",
+        "drag_multiplier",
+        "fallback_plan_size_m",
+        "fallback_height_m"
+      ],
+      "properties": {
+        "porosity_per_obstacle": {
+          "$ref": "#/$defs/fractionOrArray"
+        },
+        "twine_diameter_m": {
+          "$ref": "#/$defs/positive"
+        },
+        "drag_multiplier": {
+          "$ref": "#/$defs/positive"
+        },
+        "fallback_plan_size_m": {
+          "$ref": "#/$defs/positive"
+        },
+        "fallback_height_m": {
+          "$ref": "#/$defs/positive"
+        }
+      }
+    },
+    "hydrodynamics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wake_spread",
+        "food_plume_spread",
+        "food_recovery_lengths",
+        "minimum_speed_ratio",
+        "kinematic_viscosity_m2_s",
+        "water_density_kg_m3"
+      ],
+      "properties": {
+        "wake_spread": {
+          "$ref": "#/$defs/positive"
+        },
+        "food_plume_spread": {
+          "$ref": "#/$defs/positive"
+        },
+        "food_recovery_lengths": {
+          "$ref": "#/$defs/positive"
+        },
+        "minimum_speed_ratio": {
+          "$ref": "#/$defs/fraction"
+        },
+        "kinematic_viscosity_m2_s": {
+          "$ref": "#/$defs/positive"
+        },
+        "water_density_kg_m3": {
+          "$ref": "#/$defs/positive"
+        }
+      }
+    },
+    "sediment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "settling_velocity_m_s",
+        "in_domain_deposition_fraction",
+        "oxygen_demand_kg_o2_per_kg_organic",
+        "decay_per_day",
+        "resuspension_per_day",
+        "mortality_deposition_fraction",
+        "initial_organic_stock_kg"
+      ],
+      "properties": {
+        "settling_velocity_m_s": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "in_domain_deposition_fraction": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/fraction"
+            }
+          ]
+        },
+        "oxygen_demand_kg_o2_per_kg_organic": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "decay_per_day": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "resuspension_per_day": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "mortality_deposition_fraction": {
+          "$ref": "#/$defs/fraction"
+        },
+        "initial_organic_stock_kg": {
+          "$ref": "#/$defs/nonNegative"
+        }
+      }
+    },
+    "harvest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fraction_per_year",
+        "turnovers_per_year",
+        "n_kg_per_t_wet",
+        "p_kg_per_t_wet"
+      ],
+      "properties": {
+        "fraction_per_year": {
+          "$ref": "#/$defs/fraction"
+        },
+        "turnovers_per_year": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "n_kg_per_t_wet": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "p_kg_per_t_wet": {
+          "$ref": "#/$defs/nonNegative"
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimum_dissolved_oxygen_mg_l",
+        "minimum_probe_speed_m_s",
+        "maximum_biodeposition_kg_m2_day",
+        "minimum_obstacle_clearance_m"
+      ],
+      "properties": {
+        "minimum_dissolved_oxygen_mg_l": {
+          "$ref": "#/$defs/nullableNonNegative"
+        },
+        "minimum_probe_speed_m_s": {
+          "$ref": "#/$defs/nullableNonNegative"
+        },
+        "maximum_biodeposition_kg_m2_day": {
+          "$ref": "#/$defs/nullableNonNegative"
+        },
+        "minimum_obstacle_clearance_m": {
+          "$ref": "#/$defs/nonNegative"
+        }
+      }
+    },
+    "weights": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "extraction",
+        "flushing",
+        "food_delivery",
+        "uniformity",
+        "oxygen",
+        "low_deposition"
+      ],
+      "properties": {
+        "extraction": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "flushing": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "food_delivery": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "uniformity": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "oxygen": {
+          "$ref": "#/$defs/nonNegative"
+        },
+        "low_deposition": {
+          "$ref": "#/$defs/nonNegative"
+        }
+      }
+    },
+    "objective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "weights",
+        "target_chlorophyll_capture_g_day",
+        "target_biodeposition_kg_m2_day"
+      ],
+      "properties": {
+        "weights": {
+          "$ref": "#/$defs/weights"
+        },
+        "target_chlorophyll_capture_g_day": {
+          "$ref": "#/$defs/nullableNonNegative"
+        },
+        "target_biodeposition_kg_m2_day": {
+          "$ref": "#/$defs/positive"
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "evidence_manifest_id",
+        "allow_extrapolation"
+      ],
+      "properties": {
+        "status": {
+          "const": "UNVALIDATED_SCREENING"
+        },
+        "evidence_manifest_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "allow_extrapolation": {
+          "type": "boolean"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parameter",
+        "citation",
+        "equation",
+        "validity_envelope",
+        "doi"
+      ],
+      "properties": {
+        "parameter": {
+          "type": "string",
+          "minLength": 1
+        },
+        "citation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "equation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "validity_envelope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "doi": {
+          "type": "string",
+          "pattern": "^10\\."
+        }
+      }
+    }
+  }
+}

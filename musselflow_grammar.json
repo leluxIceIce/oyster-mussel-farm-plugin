@@ -1,0 +1,259 @@
+{
+  "schema_version": "1.0.0",
+  "case_id": "replace-with-project-and-monitoring-period",
+  "model_role": "UNVALIDATED_LAYOUT_SCREENING",
+  "units": {
+    "geometry": "Rhino document units converted to metres",
+    "flow_vector_length": "m/s",
+    "duration": "h",
+    "temperature": "degC",
+    "salinity": "PSU",
+    "dissolved_oxygen": "mg/L",
+    "chlorophyll_a": "ug/L",
+    "suspended_particulate_matter": "mg/L"
+  },
+  "forcing": {
+    "mode": "timeline",
+    "vector_source": "Grasshopper.flowVectors",
+    "steps": [
+      {
+        "id": "flood",
+        "order": 0,
+        "flow_vector_index": 0,
+        "duration_h": 6.0,
+        "boundary": {
+          "temperature_c": 12.0,
+          "salinity_psu": 20.0,
+          "dissolved_oxygen_mg_l": 9.0,
+          "chlorophyll_a_ug_l": 5.0,
+          "tsm_mg_l": 3.0
+        }
+      },
+      {
+        "id": "ebb",
+        "order": 1,
+        "flow_vector_index": 1,
+        "duration_h": 6.0,
+        "boundary": {
+          "temperature_c": 12.0,
+          "salinity_psu": 20.0,
+          "dissolved_oxygen_mg_l": 9.0,
+          "chlorophyll_a_ug_l": 5.0,
+          "tsm_mg_l": 3.0
+        }
+      }
+    ],
+    "repeat_count": 1
+  },
+  "site": {
+    "depth_m": 12.0,
+    "initial_dissolved_oxygen_mg_l": 9.0,
+    "particulate_organic_fraction": 0.35,
+    "background_sediment_oxygen_demand_g_o2_m2_day": 0.8,
+    "pelagic_respiration_g_o2_m3_day": 0.05,
+    "primary_production_g_o2_m3_day": 0.0,
+    "reaeration_per_day": 0.2,
+    "vertical_exchange_per_day": 0.5,
+    "advective_exchange_efficiency": 0.25
+  },
+  "food": {
+    "carbon_to_chlorophyll_mg_c_per_mg_chl": 50.0,
+    "organic_carbon_fraction": 0.45,
+    "small_particle_fraction": 0.2,
+    "small_particle_diameter_um": 2.0,
+    "large_particle_diameter_um": 15.0,
+    "detritus_fraction_of_organic": 0.5,
+    "detritus_preference": 0.8,
+    "detritus_assimilation_multiplier": 0.8,
+    "organic_energy_kj_g": 20.0
+  },
+  "species": {
+    "taxon": "Mytilus edulis",
+    "profile_status": "screening_prior",
+    "mean_dry_tissue_g": 0.2,
+    "size_cv": 0.3,
+    "clearance": {
+      "a_l_h": 7.45,
+      "mass_exponent": 0.66,
+      "reference_temperature_c": 12.0,
+      "q10": 1.5
+    },
+    "respiration": {
+      "a_ml_o2_h": 0.475,
+      "mass_exponent": 0.663,
+      "reference_temperature_c": 12.0,
+      "q10": 2.0
+    },
+    "retention_efficiency": 0.8,
+    "particulate_retention_efficiency": 0.8,
+    "assimilation_efficiency": 0.7,
+    "pseudofaeces_fraction": 0.1,
+    "activity_fraction": 1.0,
+    "ammonia_mg_n_g_dw_h": 0.015,
+    "low_food_threshold_ug_l": 0.7,
+    "low_food_transition_ug_l": 0.15,
+    "retention_d50_um": 5.0,
+    "retention_slope_um": 1.5,
+    "ingestion_half_saturation_ug_l": 17.0,
+    "high_food_assimilation_threshold_ug_l": 17.0,
+    "high_food_assimilation_decay_ug_l": 8.0,
+    "assimilation_quality_half_saturation": 0.15,
+    "assimilation_reference_organic_fraction": 0.35,
+    "pseudofaeces_tsm_threshold_mg_l": 4.0,
+    "pseudofaeces_tsm_transition_mg_l": 2.0,
+    "pseudofaeces_max_fraction": 0.6,
+    "oxygen_zero_saturation_fraction": 0.2,
+    "oxygen_full_saturation_fraction": 0.7,
+    "current_clearance_start_m_s": 0.2,
+    "current_clearance_zero_m_s": 0.6,
+    "current_protection_group_size": 20.0,
+    "oxycalorific_kj_per_ml_o2": 0.0201,
+    "tissue_energy_kj_g_dw": 23.5,
+    "valid_flow_max_m_s": 1.4,
+    "salinity_activity_psu": {
+      "zero_low": 4.0,
+      "full_low": 15.0,
+      "full_high": 32.0,
+      "zero_high": 42.0
+    }
+  },
+  "stocking": {
+    "mode": "animals",
+    "mussels_per_obstacle": [1000.0],
+    "live_wet_g_per_individual": 20.0,
+    "annual_mortality_fraction": 0.1,
+    "effective_aggregation_size": 20.0
+  },
+  "structure": {
+    "porosity_per_obstacle": [0.7],
+    "twine_diameter_m": 0.003,
+    "drag_multiplier": 1.0,
+    "fallback_plan_size_m": 0.1,
+    "fallback_height_m": 1.0
+  },
+  "hydrodynamics": {
+    "wake_spread": 0.12,
+    "food_plume_spread": 0.16,
+    "food_recovery_lengths": 8.0,
+    "minimum_speed_ratio": 0.02,
+    "kinematic_viscosity_m2_s": 0.0000013,
+    "water_density_kg_m3": 1020.0
+  },
+  "sediment": {
+    "settling_velocity_m_s": 0.006,
+    "in_domain_deposition_fraction": null,
+    "oxygen_demand_kg_o2_per_kg_organic": 1.0,
+    "decay_per_day": 0.05,
+    "resuspension_per_day": 0.0,
+    "mortality_deposition_fraction": 1.0,
+    "initial_organic_stock_kg": 0.0
+  },
+  "harvest": {
+    "fraction_per_year": 0.8,
+    "turnovers_per_year": 1.0,
+    "n_kg_per_t_wet": 13.7,
+    "p_kg_per_t_wet": 0.9
+  },
+  "constraints": {
+    "minimum_dissolved_oxygen_mg_l": null,
+    "minimum_probe_speed_m_s": null,
+    "maximum_biodeposition_kg_m2_day": null,
+    "minimum_obstacle_clearance_m": 0.0
+  },
+  "objective": {
+    "weights": {
+      "extraction": 0.3,
+      "flushing": 0.2,
+      "food_delivery": 0.15,
+      "uniformity": 0.1,
+      "oxygen": 0.15,
+      "low_deposition": 0.1
+    },
+    "target_chlorophyll_capture_g_day": null,
+    "target_biodeposition_kg_m2_day": 0.05
+  },
+  "validation": {
+    "status": "UNVALIDATED_SCREENING",
+    "evidence_manifest_id": null,
+    "allow_extrapolation": false
+  },
+  "evidence": [
+    {
+      "parameter": "species.clearance",
+      "citation": "Moehlenberg and Riisgaard (1979), with Riisgaard et al. (2025) synthesis",
+      "equation": "clearance_L_h = 7.45 * dry_tissue_g ** 0.66",
+      "validity_envelope": "Adult dry tissue 0.011-1.361 g; approximately 10-13 degC and 30 PSU",
+      "doi": "10.1242/bio.062024"
+    },
+    {
+      "parameter": "species.respiration",
+      "citation": "Hamburger et al. (1983), with Riisgaard et al. (2025) synthesis",
+      "equation": "respiration_mL_O2_h = 0.475 * dry_tissue_g ** 0.663",
+      "validity_envelope": "Adult dry tissue; approximately 10-13 degC and 30 PSU",
+      "doi": "10.1242/bio.062024"
+    },
+    {
+      "parameter": "species.current_response",
+      "citation": "Nielsen and Vismann (2014)",
+      "equation": "No universal multiplier; speeds outside the study envelope are flagged",
+      "validity_envelope": "0.05-1.4 m/s; aggregation strongly changed response",
+      "doi": "10.2983/035.033.0214"
+    },
+    {
+      "parameter": "species.retention",
+      "citation": "Strohmeier et al. (2012)",
+      "equation": "Editable sigmoid particle-size retention curve multiplied by maximum retention efficiency",
+      "validity_envelope": "Natural seston with strong particle-size and temporal variability; two representative classes only",
+      "doi": "10.1016/j.jembe.2011.11.006"
+    },
+    {
+      "parameter": "food.deb_lite_partition",
+      "citation": "Maar et al. (2023)",
+      "equation": "Size-selective retention, saturating ingestion, food-quality assimilation, faeces and pseudofaeces partition",
+      "validity_envelope": "Reduced screening translation of a coupled hydrodynamic-biogeochemical-DEB model; requires local calibration",
+      "doi": "10.1016/j.scitotenv.2023.164168"
+    },
+    {
+      "parameter": "species.oxygen_food_interaction",
+      "citation": "Kamermans and Saurel (2022)",
+      "equation": "Editable oxygen-saturation activity ramp multiplied into filtration",
+      "validity_envelope": "Reduced response proxy; oxygen, temperature and food interact and no universal ramp is asserted",
+      "doi": "10.1051/alr/2022001"
+    },
+    {
+      "parameter": "structure.net_drag",
+      "citation": "Lader et al. (2009)",
+      "equation": "Cd_solid = 1 + 1.37*S + 0.78*S**2, S = 1 - porosity",
+      "validity_envelope": "Knotless net-panel relation; depends on Reynolds number, geometry and angle",
+      "doi": "10.1016/j.aquaeng.2009.04.003"
+    },
+    {
+      "parameter": "oxygen.solubility",
+      "citation": "Garcia and Gordon (1992)",
+      "equation": "Dissolved-oxygen saturation from temperature and salinity",
+      "validity_envelope": "-2 to 40 degC and 0 to 42 PSU",
+      "doi": "10.4319/lo.1992.37.6.1307"
+    },
+    {
+      "parameter": "species.ammonia",
+      "citation": "Jansen et al. (2012)",
+      "equation": "Direct editable excretion prior",
+      "validity_envelope": "Annual observations; rates covaried with food and temperature",
+      "doi": "10.1016/j.jembe.2011.11.009"
+    },
+    {
+      "parameter": "sediment.biodeposition",
+      "citation": "Callier et al. (2006)",
+      "equation": "Settling-distance screen plus a first-order sediment stock",
+      "validity_envelope": "Production and dispersion vary with mussel age, particles, current and site",
+      "doi": "10.3354/meps322129"
+    },
+    {
+      "parameter": "harvest.nitrogen_phosphorus",
+      "citation": "Taylor et al. (2019), Danish mitigation-mussel context",
+      "equation": "13.7 kg N and 0.9 kg P per harvested wet tonne",
+      "validity_envelope": "Editable management-accounting prior; not predicted growth",
+      "doi": "10.3389/fmars.2019.00698"
+    }
+  ]
+}
