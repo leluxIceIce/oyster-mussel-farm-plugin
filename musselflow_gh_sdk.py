@@ -1,24 +1,13 @@
 # r: numpy
 """
 Plan-view flow analysis of water passing a formation of mussel dropper-lines.
-SDK-mode version: typed RunScript inputs/outputs (the node self-declares its
-type hints) plus a custom viewport preview that draws a color legend, a flow
-arrow and the domain frame -- so the analysis reads like a chart inside Rhino,
-no baking or PNG needed.
-
-Looks straight down at the water: water flows in FlowDir, each dropper line
-(buoy line + mesh sock + mussels) is a vertical body seen as a cross-section from
-above. Socks may be Points (circle via Radius), closed Curves, Meshes or
-Surfaces; 3D socks are projected into plan silhouettes so every supplied object
-participates even when geometries occupy different Z levels. Numbers are
-dimensionless -- use them to RANK layouts.
-
-Paste into a Python 3 Script component, then switch it to SDK mode (dashboard:
-"Convert to SDK mode" / the class below). numpy loads via the `# r: numpy` line.
+SDK-mode version: typed RunScript inputs/outputs plus a custom viewport preview 
+that draws a color legend, a flow arrow and the domain frame -- so the analysis 
+reads like a chart inside Rhino, no baking needed.
 -
 Name: MusselFlowAnalysisSDK
 Updated: 260801
-Author: Felix (with Claude)
+Author: Felix Berger
 Copyright: Creative Commons - Attribution 4.0 International
 
     Inputs (RunScript annotations set these hints automatically):
@@ -604,14 +593,14 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
     SESTON_D = 0.15
 
     def RunScript(self,
-                  run: bool,
-                  socks: Grasshopper.DataTree[object],
-                  radius: float,
-                  flowDir: Grasshopper.DataTree[Rhino.Geometry.Vector3d],
-                  domain: "Rhino.Geometry.Rectangle3d",
-                  resolution: int,
-                  regions: "System.Collections.Generic.List[Rhino.Geometry.Curve]",
-                  uptake: float):
+            run: bool,
+            socks: Grasshopper.DataTree[object],
+            radius: float,
+            flowDir: Grasshopper.DataTree[Rhino.Geometry.Vector3d],
+            domain: Rhino.Geometry.GeometryBase,
+            resolution: int,
+            regions: list[Rhino.Geometry.Curve],
+            uptake: float):
         """Average all valid vectors, then run the established solver once."""
         self._draw = None
         sockItems = toList(socks)
