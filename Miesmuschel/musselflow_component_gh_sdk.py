@@ -3,27 +3,29 @@
 MusselFlow Ecological Optimizer
 ===============================
 
-Fast Rhino 8 Grasshopper Python 3 SDK-mode component for comparative
-plan-view screening of mussel sock/net/frame layouts under multiple currents.
+Fast Rhino 8 / Grasshopper SDK component for exploring how mussel socks,
+nets and frames can behave as one coordinated hydraulic field under multiple currents.
 
-The component validates Rhino geometry and one strict ecological grammar, converts each
-obstacle into the existing reduced-order numerical descriptor, evaluates the
-current timeline, and returns one Galapagos fitness plus a canonical structured
-result. It does not generate colored meshes or animation; selected-design
-visualization belongs in a separate Preview component.
+Every farm layout becomes a test of ecological choreography: where water is
+redirected, where fresh food reaches the mussels, where filtration accumulates,
+and where weak flushing raises deposition or oxygen risk. Rhino geometry and
+the ecological grammar are read together across changing current scenarios,
+then distilled into one Galapagos fitness and a detailed result. Flow and food
+visualizations remain in their dedicated component, keeping the evolutionary
+search light enough to explore thousands of arrangements.
 
 Scientific scope
 ----------------
-The component uses the reduced-order hydrodynamic/biological core. Results
-remain ``UNVALIDATED_SCREENING`` and are
-comparative estimates, not CFD, carrying-capacity proof, regulatory assessment,
-predicted annual growth, verified nutrient mitigation, or carbon removal.
-No trained machine-learning or reinforcement-learning model is active.
+The core is intentionally reduced-order: fast enough to search a large design
+space while remaining clearly labelled ``UNVALIDATED_SCREENING``. Its outputs
+are comparative estimates, not CFD, carrying-capacity proof, regulatory
+assessment, predicted annual growth, verified nutrient mitigation, or carbon
+removal. No trained machine-learning or reinforcement-learning model is active.
 
 Required companion files
 ------------------------
-Place these files beside the saved Grasshopper definition, or keep them in the
-development workspace:
+Keep these internal modules together with this component in the
+``Miesmuschel`` folder, or beside the saved Grasshopper definition:
 
 * ``musselflow_case_core.py``
 * ``musselflow_ecogrammar_core.py``
