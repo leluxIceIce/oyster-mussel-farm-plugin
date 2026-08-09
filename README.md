@@ -1,18 +1,17 @@
 # MusselFlow
 
-MusselFlow is a Rhino 8 / Grasshopper research toolkit for parametric mussel-farm design. It connects generated farm geometry to deterministic reduced-order screening of current exposure, food delivery, filtration, dissolved-oxygen risk, deposition, and ecological constraints. Copernicus components provide regional site forcing and spatial field exploration.
+MusselFlow is a Rhino 8 / Grasshopper research toolkit for computational exploration of large-scale mussel farm design strategies. It has a solver build up as a deterministic reduced-order screening of current exposure, food delivery, filtration, dissolved-oxygen risk, deposition, and ecological constraints. Copernicus components provide regional site forcing and spatial field exploration.
 
 ## Current status
 
-This repository contains the canonical working Python sources selected from the development workspace. Historical prototypes and superseded heuristic solvers are intentionally excluded.
-
+This repository contains the canonical working Python sources selected from the development workspace.
 MusselFlow is a comparative screening model. It is not CFD, a calibrated carrying-capacity model, verified nutrient or carbon removal, a legal assessment, or a substitute for site monitoring.
 
 ## Pipeline
 
 ```mermaid
 flowchart LR
-  G["Parametric geometry<br/>centres, orientation, rod dimensions"] --> O["MusselFlow optimizer"]
+  G[“Mesh geometry<br/>centres, orientation, rod dimensions"] --> O["MusselFlow optimizer"]
   C["Ecological grammar<br/>coefficients, objectives, constraints"] --> O
   X["Search context"] --> B["Copernicus browser"]
   B --> R["Fetch request"]
@@ -27,11 +26,11 @@ flowchart LR
 
 ## Canonical components
 
-- `musselflow_component_gh_sdk.py` — ecological optimizer and Galapagos fitness.
+- `musselflow_component_gh_sdk.py` — ecological optimizer and Galapagos fitness input.
 - `musselflow_gh_sdk.py` — detailed plan-view flow and food visualization.
 - `copernicus_search_context_gh_sdk.py` — validated WGS84/time/depth/variable query.
-- `copernicus_data_browser_gh_sdk.py` — cross-platform Eto catalogue browser.
-- `musselflow_site_data_gh_sdk.py` — regional Copernicus sampling and case compilation.
+- `copernicus_data_browser_gh_sdk.py` — internal API-called Eto catalogue browser.
+- `musselflow_site_data_gh_sdk.py` — Sample regional Copernicus satellite data and compile the field data.
 - `musselflow_site_field_gh_sdk.py` — spatial environmental field generation.
 - `musselflow_multivariate_gh_sdk.py` — correlation and PCA exploration.
 - `musselflow_cluster_genome_gh_sdk.py`, `musselflow_family_decoder_gh_sdk.py`, `musselflow_geometry_gh_sdk.py`, and `kangaroo_frame_loft_gh_sdk.py` — parametric farm geometry tools.
