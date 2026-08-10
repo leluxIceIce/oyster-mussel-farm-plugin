@@ -1,18 +1,22 @@
 # r: numpy
 """
-MusselFlow Ecological Optimizer
-===============================
+MusselFlow Fitness Assembly
+===========================
 
-Fast Rhino 8 / Grasshopper SDK component for exploring how mussel socks,
-nets and frames can behave as one coordinated hydraulic field under multiple currents.
+REDUCED ORDER: Xplore how mussel socks (nets and frames) behave as one coordinated hydraulic field under multiple currents.
 
-Every farm layout becomes a test of ecological choreography: where water is
+Every farm layout becomes a test of ecological swarm behaviour: where water is
 redirected, where fresh food reaches the mussels, where filtration accumulates,
 and where weak flushing raises deposition or oxygen risk. Rhino geometry and
 the ecological grammar are read together across changing current scenarios,
 then distilled into one Galapagos fitness and a detailed result. Flow and food
 visualizations remain in their dedicated component, keeping the evolutionary
 search light enough to explore thousands of arrangements.
+
+Name: MusselFlowOptimizer
+Updated: 260808
+Author: Felix Berger
+Copyright: Apache License 2.0 
 
 Scientific scope
 ----------------
@@ -76,16 +80,6 @@ Status : item / str
     SOLVER_ERROR, OUT_OF_ENVELOPE, INFEASIBLE, or UNVALIDATED_SCREENING.
 Report : list / str
     Timing, units, scenario mapping, assumptions, warnings, and limitations.
-
-Grasshopper SDK setup
----------------------
-Paste this file into a Rhino 8 Python 3 component and use
-``Convert To GH_ScriptInstance``. The typed ``RunScript`` signature then
-    synchronizes the eight input ports and their access/type hints. This script also
-assigns human-readable names and hover descriptions to every existing input and
-output port. Grasshopper cannot infer seven named output ports from a Python
-return tuple, so create the seven outputs once in the order above, then save the
-configured component as a User Object for drag-and-drop reuse.
 
 Current forcing limitation
 --------------------------
