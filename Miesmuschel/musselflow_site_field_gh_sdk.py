@@ -32,8 +32,9 @@ variable : item / str
     current_speed, temperature, salinity, oxygen, chlorophyll,
     satellite_chlorophyll, phytoplankton_carbon, nitrate, phosphate, tsm,
     or turbidity.
-timeIndex : item / int
-    Frame index from SiteData.Times. Values outside the range are clamped.
+timeIndex : item / str
+    Frame index or ISO UTC timestamp from SiteData.Times. Numeric indices are
+    clamped; timestamps select the exact or nearest available frame.
 depth : item / float
     Positive sampling depth in metres. Surface products ignore this value.
 resolution : item / int
@@ -81,6 +82,7 @@ all names and human-readable hover tooltips.
 """
 
 import concurrent.futures
+import datetime
 import hashlib
 import json
 import math
@@ -93,7 +95,7 @@ import Rhino
 import System.Drawing
 
 
-COMPONENT_BUILD = "2026-08-08c"
+COMPONENT_BUILD = "2026-08-10a"
 WMTS_ENDPOINT = "https://wmts.marine.copernicus.eu/teroWmts/"
 TILE_LEVEL = 10
 HTTP_TIMEOUT_S = 25
@@ -188,7 +190,7 @@ INPUT_METADATA = (
     ("SiteDataJson", "SiteData", "Actual sampled SiteDataJson from MusselFlow Site Data."),
     ("domain", "domain", "Closed planar curve defining the sampled tile size and shape."),
     ("variable", "variable", "Physical field name, e.g. chlorophyll, oxygen, nitrate, or current_speed."),
-    ("timeIndex", "timeIndex", "Index of the SiteData frame used as the field timestamp."),
+    ("timeIndex", "timeIndex", "Frame index or ISO UTC timestamp; timestamps select the exact or nearest SiteData frame."),
     ("depth", "depth", "Positive depth in metres; ignored by surface satellite products."),
     ("resolution", "resolution", "Grid cells along the longer domain side, 4-24; twelve recommended."),
     ("sizePower", "sizePower", "Hotspot radius exponent; 2 emphasizes high values."),
@@ -294,6 +296,75 @@ def parse_site_data(source):
     if latitude is None or longitude is None:
         raise ValueError("siteData is missing requested latitude/longitude.")
     return document, latitude, longitude, frames
+
+
+def timestamp_text(value):
+    """Return a stable UTC-like string for Python, .NET, or Grasshopper values."""
+    if value is None:
+        return ""
+    try:
+        return value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss'Z'")
+    except Exception:
+        return str(value).strip()
+
+
+def parse_utc_timestamp(value):
+    text = timestamp_text(value)
+    if not text:
+        return None
+    candidate = text[:-1]+"+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.datetime.fromisoformat(candidate)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def select_frame(frames, selector):
+    """Resolve a zero-based index or timestamp to one SiteData frame."""
+    timestamps = [str(frame.get("time_utc") or "").strip() for frame in frames]
+    if any(not value for value in timestamps):
+        raise ValueError("one or more SiteData frames have no time_utc value.")
+
+    text = timestamp_text(selector)
+    if not text:
+        return 0, timestamps[0], "default frame 0"
+
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is not None and math.isfinite(numeric):
+        requested = int(numeric)
+        index = max(0, min(len(frames)-1, requested))
+        note = "frame index %d" % requested
+        if index != requested:
+            note += " clamped to %d" % index
+        return index, timestamps[index], note
+
+    for index, timestamp in enumerate(timestamps):
+        if text == timestamp:
+            return index, timestamp, "exact timestamp"
+
+    requested_time = parse_utc_timestamp(text)
+    candidates = [
+        (index, parse_utc_timestamp(timestamp))
+        for index, timestamp in enumerate(timestamps)
+    ]
+    candidates = [
+        (index, value) for index, value in candidates if value is not None
+    ]
+    if requested_time is None or not candidates:
+        raise ValueError(
+            "timeIndex must be a zero-based frame index or ISO timestamp "
+            "present in SiteData.Times; received '%s'." % text)
+
+    index, _ = min(
+        candidates,
+        key=lambda item: abs((item[1]-requested_time).total_seconds()))
+    return index, timestamps[index], "nearest timestamp to %s" % text
 
 
 def curve_plane(curve, tolerance):
@@ -630,7 +701,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             siteData: str,
             domain: Rhino.Geometry.Curve,
             variable: str,
-            timeIndex: int,
+            timeIndex: str,
             depth: float,
             resolution: int,
             sizePower: float,
@@ -652,13 +723,11 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 raise ValueError(
                     "siteData regional catalogue has no '%s' layer."
                     % specification["layer"])
-            index = 0 if timeIndex is None else int(timeIndex)
-            index = max(0, min(len(frames)-1, index))
-            timestamp = str(frames[index].get("time_utc") or "")
-            if not timestamp:
-                raise ValueError("selected SiteData frame has no timestamp.")
-            if specification["daily"]:
-                timestamp = daily_time(timestamp)
+            index, frame_timestamp, time_selection = select_frame(
+                frames, timeIndex)
+            timestamp = (
+                daily_time(frame_timestamp)
+                if specification["daily"] else frame_timestamp)
             sample_depth = abs(finite_number(depth) or 0.0)
             count = 12 if resolution is None else int(resolution)
             count = max(4, min(24, count))
@@ -733,6 +802,8 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             "variable": selected_variable,
             "units": specification["units"],
             "time_utc": timestamp,
+            "source_frame_index": index,
+            "source_frame_time_utc": frame_timestamp,
             "depth_m": None if specification["surface"] else sample_depth,
             "regional_product": region,
             "anchor": {"latitude": anchor_lat, "longitude": anchor_lon},
@@ -800,6 +871,8 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             % (missing_before, cached_before, len(errors)),
             "SOURCE CELLS | %d distinct Copernicus cells represented"
             % unique_cells,
+            "TIME SELECTION | %s | frame %d | %s"
+            % (time_selection, index, frame_timestamp),
         ]
         if unit_warning:
             report.append("UNIT WARNING | "+unit_warning)
