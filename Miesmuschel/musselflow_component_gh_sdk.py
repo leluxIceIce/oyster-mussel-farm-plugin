@@ -723,7 +723,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             domain: Rhino.Geometry.Curve,
             probes: list[Rhino.Geometry.Point3d],
             flowVectors: list[Rhino.Geometry.Vector3d],
-            caseJson: str,
+            SimulationCaseJson: str,
             qualityMode: int,
             speedMode: bool):
         """
@@ -898,7 +898,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             probe_records.append(
                 (path, branch_index, item_index, point))
 
-        if caseJson is None or not str(caseJson).strip():
+        if SimulationCaseJson is None or not str(SimulationCaseJson).strip():
             return empty_outputs(
                 "INVALID_CASE",
                 "SimulationCaseJson is empty. Connect Site Data.SimulationCaseJson, or the base model for a manual case.")
@@ -914,7 +914,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         try:
             compiled_case, case_cache_hit = compile_case_cached(
                 case_core,
-                caseJson,
+                SimulationCaseJson,
                 len(obstacle_records),
                 len(flow_records))
             (case, digest, config, flow_indices,
