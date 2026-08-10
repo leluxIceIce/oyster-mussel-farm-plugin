@@ -35,8 +35,9 @@ variable : item / str
 timeIndex : item / str
     Frame index or ISO UTC timestamp from SiteData.Times. Numeric indices are
     clamped; timestamps select the exact or nearest available frame.
-depth : item / float
-    Positive sampling depth in metres. Surface products ignore this value.
+depth : item / object
+    Sampling depth in metres. Accepts a number or numeric text such as 1, 1.0,
+    or "1 m". Empty input defaults to the surface.
 resolution : item / int
     Cells along the domain's longer side, clamped to 4-24. Twelve is recommended.
 sizePower : item / float
@@ -95,7 +96,7 @@ import Rhino
 import System.Drawing
 
 
-COMPONENT_BUILD = "2026-08-10a"
+COMPONENT_BUILD = "2026-08-10b"
 WMTS_ENDPOINT = "https://wmts.marine.copernicus.eu/teroWmts/"
 TILE_LEVEL = 10
 HTTP_TIMEOUT_S = 25
@@ -191,7 +192,7 @@ INPUT_METADATA = (
     ("domain", "domain", "Closed planar curve defining the sampled tile size and shape."),
     ("variable", "variable", "Physical field name, e.g. chlorophyll, oxygen, nitrate, or current_speed."),
     ("timeIndex", "timeIndex", "Frame index or ISO UTC timestamp; timestamps select the exact or nearest SiteData frame."),
-    ("depth", "depth", "Positive depth in metres; ignored by surface satellite products."),
+    ("depth", "depth", "Depth in metres as a number or numeric text; empty input means surface."),
     ("resolution", "resolution", "Grid cells along the longer domain side, 4-24; twelve recommended."),
     ("sizePower", "sizePower", "Hotspot radius exponent; 2 emphasizes high values."),
     ("colors", "colors", "Optional ordered System.Drawing colour stops, low to high."),
@@ -276,6 +277,25 @@ def variable_name(value):
     text = "chlorophyll" if value is None else str(value).strip().lower()
     text = text.replace("-", "_").replace(" ", "_")
     return ALIASES.get(text, text)
+
+
+def depth_metres(value):
+    """Accept Grasshopper numbers and numeric Panel text without silent coercion."""
+    if value is None or not str(value).strip():
+        return 0.0
+    number = finite_number(value)
+    if number is None:
+        text = str(value).strip().lower().replace(",", ".")
+        for suffix in (" metres", " meters", " metre", " meter", " m"):
+            if text.endswith(suffix):
+                text = text[:-len(suffix)].strip()
+                break
+        number = finite_number(text)
+    if number is None:
+        raise ValueError(
+            "depth must be one number in metres, for example 1 or '1 m'; "
+            "received '%s'." % str(value))
+    return abs(number)
 
 
 def parse_site_data(source):
@@ -702,7 +722,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             domain: Rhino.Geometry.Curve,
             variable: str,
             timeIndex: str,
-            depth: float,
+            depth: object,
             resolution: int,
             sizePower: float,
             colors: list[System.Drawing.Color],
@@ -728,7 +748,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             timestamp = (
                 daily_time(frame_timestamp)
                 if specification["daily"] else frame_timestamp)
-            sample_depth = abs(finite_number(depth) or 0.0)
+            sample_depth = depth_metres(depth)
             count = 12 if resolution is None else int(resolution)
             count = max(4, min(24, count))
             power = finite_number(sizePower)
