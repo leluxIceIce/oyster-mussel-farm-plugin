@@ -6,11 +6,11 @@ A Rhino 8 / Grasshopper workflow for generating mussel-farm geometries, loading 
 
 ```mermaid
 flowchart LR
-  UV["U + V Gene Pools"] --> D["Gene Pool Decoder"]
-  RL["RodLength Gene Pool"] --> D
+  UV["UV Genepool"] --> D["Genepool Decoder"]
+  RL["RodLength Genepool"] --> D
   D --> G["Mussel geometry"]
 
-  G --> O["MusselFlow Fitness Optimizer"]
+  G --> O["MusselFlow Fitness Assembly"]
   G --> V["Hydrodynamic Visualization"]
 
   C["Copernicus Search Context"] --> B["Copernicus Browser"]
