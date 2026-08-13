@@ -684,7 +684,10 @@ def _compile_shared(case, obstacle_count):
     them: :func:`compile_timeline` from a single shared timeline boundary,
     or :func:`ensemble_state_configs` per independent ensemble state.
     """
-    from musselflow_ecogrammar_core import DEFAULTS
+    try:
+        from .ecogrammar_core import DEFAULTS
+    except (ImportError, ValueError):
+        from musselflow_ecogrammar_core import DEFAULTS
 
     config = copy.deepcopy(DEFAULTS)
     site = case["site"]
@@ -914,7 +917,10 @@ def compile_timeline(case, obstacle_count, flow_count):
             "The current oxygen/sediment sequence supports one shared boundary; "
             "scenario-varying timeline boundaries need the per-step evaluator.")
 
-    from musselflow_ecogrammar_core import validate_config
+    try:
+        from .ecogrammar_core import validate_config
+    except (ImportError, ValueError):
+        from musselflow_ecogrammar_core import validate_config
 
     config = _compile_shared(case, obstacle_count)
     _apply_boundary(config, steps[0]["boundary"])
@@ -960,7 +966,10 @@ def compile_ensemble(case, obstacle_count, flow_count):
             "compile_ensemble handles ensemble forcing; use "
             "compile_timeline for timelines.")
 
-    from musselflow_ecogrammar_core import validate_config
+    try:
+        from .ecogrammar_core import validate_config
+    except (ImportError, ValueError):
+        from musselflow_ecogrammar_core import validate_config
 
     base_config = _compile_shared(case, obstacle_count)
     states = [

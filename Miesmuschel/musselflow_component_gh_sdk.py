@@ -26,10 +26,12 @@ are comparative estimates, not CFD, carrying-capacity proof, regulatory
 assessment, predicted annual growth, verified nutrient mitigation, or carbon
 removal. No trained machine-learning or reinforcement-learning model is active.
 
-Required companion files
-------------------------
-Keep these internal modules together with this component in the
-``Miesmuschel`` folder, or beside the saved Grasshopper definition:
+Runtime modules
+---------------
+An installed Script Plugin loads the internal musselflow package directly.
+During raw Grasshopper development, the existing four sidecar files remain a
+fully supported fallback. One run always uses one complete runtime; packaged
+and loose modules are never mixed:
 
 * ``musselflow_case_core.py``
 * ``musselflow_ecogrammar_core.py``
@@ -392,6 +394,49 @@ def project_folders(component):
     return folders
 
 
+def load_packaged_runtime_modules():
+    """Load one coherent runtime from an installed Script Plugin package.
+
+    None means that no MusselFlow package is installed and explicitly permits
+    the loose sidecar fallback. Once the package itself exists, missing
+    modules or APIs are treated as an incomplete installation. This prevents
+    one run from silently mixing packaged and development modules.
+    """
+    try:
+        import musselflow
+    except ImportError:
+        return None
+
+    try:
+        from musselflow import case_core
+        from musselflow import ecogrammar_core
+        from musselflow import optimizer_core
+        from musselflow import geometry_bridge
+    except ImportError as exception:
+        raise ImportError(
+            "INCOMPLETE PACKAGED LIBRARY | The musselflow package was found, "
+            "but one or more internal modules could not be imported. DETAILS | "
+            "%s" % exception) from exception
+
+    required_apis = (
+        (case_core, "case_core", ("parse_case", "compile_timeline")),
+        (ecogrammar_core, "ecogrammar_core",
+         ("DEFAULTS", "validate_config")),
+        (optimizer_core, "optimizer_core",
+         ("evaluate_layout", "evaluate_ensemble")),
+        (geometry_bridge, "geometry_bridge",
+         ("build_descriptors", "build_hydraulic_profiles",
+          "collision_score")),
+    )
+    for module, label, names in required_apis:
+        missing = [name for name in names if not hasattr(module, name)]
+        if missing:
+            raise ImportError(
+                "OUTDATED PACKAGED LIBRARY | musselflow.%s is missing %s."
+                % (label, ", ".join(missing)))
+
+    return case_core, optimizer_core, geometry_bridge
+
 def load_project_module(component, module_name):
     """Import a sidecar and reload it only when its source file changed.
 
@@ -448,7 +493,11 @@ def load_case_core(component):
 
 
 def load_runtime_modules(component):
-    """Load the case parser, numerical core, and Rhino descriptor bridge."""
+    """Load one packaged runtime, or one complete loose-file runtime."""
+    packaged_modules = load_packaged_runtime_modules()
+    if packaged_modules is not None:
+        return packaged_modules
+
     # Dependency order matters when source files were edited between solutions.
     load_project_module(component, "musselflow_ecogrammar_core")
     case_core = load_case_core(component)

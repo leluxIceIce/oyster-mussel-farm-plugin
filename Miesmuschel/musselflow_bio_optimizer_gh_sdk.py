@@ -97,7 +97,23 @@ def resolve_geometry(value):
 
 
 def load_numeric_modules(component):
-    """Load the testable numerical modules without hard-wiring them into Rhino."""
+    """Load one packaged numerical runtime, or the complete sidecar pair."""
+    try:
+        import musselflow
+    except ImportError:
+        musselflow = None
+
+    if musselflow is not None:
+        try:
+            from musselflow import ecogrammar_core
+            from musselflow import optimizer_core
+        except ImportError as exception:
+            raise ImportError(
+                "INCOMPLETE PACKAGED LIBRARY | The musselflow package exists, "
+                "but its numerical modules could not be imported. DETAILS | %s"
+                % exception) from exception
+        return ecogrammar_core, optimizer_core
+
     module_names = (
         "musselflow_ecogrammar_core",
         "musselflow_bio_optimizer_core",
