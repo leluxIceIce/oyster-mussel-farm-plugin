@@ -1,24 +1,21 @@
 """
-MusselFlow Copernicus Field
-===========================
+MusselFlow Copernicus Field — Georeferenced Environmental Preview
+=================================================================
 
-Self-contained Rhino 8 Grasshopper Python 3 SDK-mode component. It turns one
-MusselFlow SiteData JSON document into a spatial Copernicus field sampled inside
-a closed planar Rhino domain. Raw values remain in physical source units while
-the preview uses normalized colour and circle size only for visual comparison.
+Samples one physical variable from a MusselFlow SiteData JSON document across a
+closed Rhino domain. It preserves the WGS84 anchor and physical source values,
+then creates coloured field cells and hotspot geometry for spatial comparison.
 
-This component uses Python's standard library, RhinoCommon, Grasshopper, and
-System.Drawing included with Rhino. It needs no external executable, desktop
-helper, Python package, account credential, or operating-system-specific path.
+The component distinguishes depth-aware regional model fields from surface-only
+ocean-colour observations. Its HTTP backend uses Rhino's bundled Python standard
+library, allowing the same data contract to be reused on Windows and macOS.
 
-Important data distinction
---------------------------
-The component samples processed Copernicus model or ocean-colour products. It
-does not download raw Sentinel multispectral bands and does not reproduce SNAP
-atmospheric correction, masking, custom indices, or a multispectral data cube.
+Name: MusselFlow Copernicus Field
+Updated: 260813
+Author: Felix Berger
+Copyright: Apache License 2.0
 
-Inputs
-------
+Inputs:
 fetch : item / bool
     Connect a Button. True fetches missing samples. Identical URLs are cached in
     memory, so a held Toggle does not repeatedly contact Copernicus.
@@ -31,13 +28,16 @@ domain : item / Rhino.Geometry.Curve
 variable : item / str
     current_speed, temperature, salinity, oxygen, chlorophyll,
     satellite_chlorophyll, phytoplankton_carbon, nitrate, phosphate, tsm,
-    or turbidity.
-timeIndex : item / str
-    Frame index or ISO UTC timestamp from SiteData.Times. Numeric indices are
-    clamped; timestamps select the exact or nearest available frame.
-depth : item / object
-    Sampling depth in metres. Accepts a number or numeric text such as 1, 1.0,
-    or "1 m". Empty input defaults to the surface.
+    or turbidity. ``chlorophyll`` is the depth-aware 7 km regional model;
+    ``satellite_chlorophyll`` is the surface-only 300 m Sentinel-3 OLCI
+    open-water field.
+timeIndex : item / object
+    Prefer an integer frame index: 0 selects the first SiteData frame, 1 the
+    second, and so on. For safe direct wiring, an ISO timestamp from
+    SiteData.Times is also accepted and resolved to its corresponding index.
+    Missing daily satellite observations search backward by up to 30 days.
+depth : item / float
+    Positive sampling depth in metres. Surface products ignore this value.
 resolution : item / int
     Cells along the domain's longer side, clamped to 4-24. Twelve is recommended.
 sizePower : item / float
@@ -51,6 +51,12 @@ placementPoint : item / Rhino.Geometry.Point3d
     Optional Rhino point at which the centre of the visualized tile is placed.
     This translates preview geometry only; it never changes the SiteData
     latitude/longitude used for Copernicus sampling.
+
+Data distinction:
+    The component samples processed Copernicus model or ocean-colour products.
+    It does not download raw Sentinel multispectral bands and does not reproduce
+    SNAP atmospheric correction, masking, custom indices, or a multispectral
+    data cube.
 
 Outputs — create nine ports once in this exact order
 ----------------------------------------------------
@@ -96,12 +102,13 @@ import Rhino
 import System.Drawing
 
 
-COMPONENT_BUILD = "2026-08-10b"
+COMPONENT_BUILD = "2026-08-13b"
 WMTS_ENDPOINT = "https://wmts.marine.copernicus.eu/teroWmts/"
 TILE_LEVEL = 10
 HTTP_TIMEOUT_S = 25
 MAX_WORKERS = 8
 MAX_SAMPLES = 576
+SATELLITE_LOOKBACK_DAYS = 30
 
 VARIABLES = {
     "current_speed": {
@@ -123,10 +130,15 @@ VARIABLES = {
     "chlorophyll": {
         "layer": "chlorophyll", "units": "ug/L", "kind": "scalar",
         "daily": True, "surface": False,
+        "source": "Northwest Shelf regional biogeochemical model",
+        "nominal_resolution_m": 7000.0,
     },
     "satellite_chlorophyll": {
         "layer": "satellite_chlorophyll", "units": "ug/L",
         "kind": "scalar", "daily": True, "surface": True,
+        "source": "Sentinel-3A/B OLCI open-ocean colour",
+        "nominal_resolution_m": 300.0,
+        "lookback_days": SATELLITE_LOOKBACK_DAYS,
     },
     "phytoplankton_carbon": {
         "layer": "phytoplankton_carbon", "units": "mmol/m3",
@@ -143,10 +155,12 @@ VARIABLES = {
     "tsm": {
         "layer": "tsm", "units": "mg/L", "kind": "scalar",
         "daily": True, "surface": True,
+        "lookback_days": SATELLITE_LOOKBACK_DAYS,
     },
     "turbidity": {
         "layer": "turbidity", "units": "FNU", "kind": "scalar",
         "daily": True, "surface": True,
+        "lookback_days": SATELLITE_LOOKBACK_DAYS,
     },
 }
 
@@ -168,6 +182,9 @@ ALIASES = {
     "chlorophyll_a": "chlorophyll",
     "chlorophyll_a_ug_l": "chlorophyll",
     "satellite_chl": "satellite_chlorophyll",
+    "surface_chlorophyll": "satellite_chlorophyll",
+    "chlorophyll_surface": "satellite_chlorophyll",
+    "chlorophyll_depth_model": "chlorophyll",
     "ocean_colour_chlorophyll": "satellite_chlorophyll",
     "ocean_color_chlorophyll": "satellite_chlorophyll",
     "phyc": "phytoplankton_carbon",
@@ -190,9 +207,9 @@ INPUT_METADATA = (
     ("fetch", "fetch", "Button: fetch missing field samples; repeated URLs use memory cache."),
     ("SiteDataJson", "SiteData", "Actual sampled SiteDataJson from MusselFlow Site Data."),
     ("domain", "domain", "Closed planar curve defining the sampled tile size and shape."),
-    ("variable", "variable", "Physical field name, e.g. chlorophyll, oxygen, nitrate, or current_speed."),
-    ("timeIndex", "timeIndex", "Frame index or ISO UTC timestamp; timestamps select the exact or nearest SiteData frame."),
-    ("depth", "depth", "Depth in metres as a number or numeric text; empty input means surface."),
+    ("variable", "variable", "Field name. For chlorophyll: satellite_chlorophyll = 300 m surface Sentinel-3 OLCI; chlorophyll = depth-aware regional model."),
+    ("timeIndex", "timeIndex", "Integer frame index or exact SiteData timestamp. Missing daily satellite data searches backward up to 30 days."),
+    ("depth", "depth", "Positive depth in metres; ignored by surface satellite products."),
     ("resolution", "resolution", "Grid cells along the longer domain side, 4-24; twelve recommended."),
     ("sizePower", "sizePower", "Hotspot radius exponent; 2 emphasizes high values."),
     ("colors", "colors", "Optional ordered System.Drawing colour stops, low to high."),
@@ -279,25 +296,6 @@ def variable_name(value):
     return ALIASES.get(text, text)
 
 
-def depth_metres(value):
-    """Accept Grasshopper numbers and numeric Panel text without silent coercion."""
-    if value is None or not str(value).strip():
-        return 0.0
-    number = finite_number(value)
-    if number is None:
-        text = str(value).strip().lower().replace(",", ".")
-        for suffix in (" metres", " meters", " metre", " meter", " m"):
-            if text.endswith(suffix):
-                text = text[:-len(suffix)].strip()
-                break
-        number = finite_number(text)
-    if number is None:
-        raise ValueError(
-            "depth must be one number in metres, for example 1 or '1 m'; "
-            "received '%s'." % str(value))
-    return abs(number)
-
-
 def parse_site_data(source):
     try:
         document = json.loads(str(source))
@@ -318,73 +316,38 @@ def parse_site_data(source):
     return document, latitude, longitude, frames
 
 
-def timestamp_text(value):
-    """Return a stable UTC-like string for Python, .NET, or Grasshopper values."""
-    if value is None:
-        return ""
-    try:
-        return value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss'Z'")
-    except Exception:
-        return str(value).strip()
+def normalize_timestamp(value):
+    """Normalize an ISO timestamp for exact frame matching."""
+    text = "" if value is None else str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1]+"+00:00"
+    return text
 
 
-def parse_utc_timestamp(value):
-    text = timestamp_text(value)
-    if not text:
-        return None
-    candidate = text[:-1]+"+00:00" if text.endswith("Z") else text
+def resolve_frame(value, frames):
+    """Return (index, selection mode) from an integer or ISO timestamp."""
+    if value is None or not str(value).strip():
+        return 0, "default index"
+
+    # Keep integer indices as the canonical internal representation. Decimal
+    # strings are accepted because Grasshopper Panels commonly provide text.
+    text = str(value).strip()
     try:
-        parsed = datetime.datetime.fromisoformat(candidate)
+        number = float(text)
+        if math.isfinite(number) and number.is_integer():
+            index = max(0, min(len(frames)-1, int(number)))
+            return index, "frame index"
     except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.astimezone(datetime.timezone.utc)
+        pass
 
-
-def select_frame(frames, selector):
-    """Resolve a zero-based index or timestamp to one SiteData frame."""
-    timestamps = [str(frame.get("time_utc") or "").strip() for frame in frames]
-    if any(not value for value in timestamps):
-        raise ValueError("one or more SiteData frames have no time_utc value.")
-
-    text = timestamp_text(selector)
-    if not text:
-        return 0, timestamps[0], "default frame 0"
-
-    try:
-        numeric = float(text)
-    except (TypeError, ValueError):
-        numeric = None
-    if numeric is not None and math.isfinite(numeric):
-        requested = int(numeric)
-        index = max(0, min(len(frames)-1, requested))
-        note = "frame index %d" % requested
-        if index != requested:
-            note += " clamped to %d" % index
-        return index, timestamps[index], note
-
-    for index, timestamp in enumerate(timestamps):
-        if text == timestamp:
-            return index, timestamp, "exact timestamp"
-
-    requested_time = parse_utc_timestamp(text)
-    candidates = [
-        (index, parse_utc_timestamp(timestamp))
-        for index, timestamp in enumerate(timestamps)
-    ]
-    candidates = [
-        (index, value) for index, value in candidates if value is not None
-    ]
-    if requested_time is None or not candidates:
-        raise ValueError(
-            "timeIndex must be a zero-based frame index or ISO timestamp "
-            "present in SiteData.Times; received '%s'." % text)
-
-    index, _ = min(
-        candidates,
-        key=lambda item: abs((item[1]-requested_time).total_seconds()))
-    return index, timestamps[index], "nearest timestamp to %s" % text
+    requested = normalize_timestamp(text)
+    for index, frame in enumerate(frames):
+        candidate = normalize_timestamp(frame.get("time_utc"))
+        if candidate == requested:
+            return index, "exact timestamp"
+    raise ValueError(
+        "timeIndex must be an integer frame index or an exact timestamp from "
+        "SiteData.Times. Received: %s" % text)
 
 
 def curve_plane(curve, tolerance):
@@ -539,6 +502,23 @@ def feature_url(layer, latitude, longitude, timestamp, depth=None):
     return WMTS_ENDPOINT+"?"+urllib.parse.urlencode(query)
 
 
+def ocean_colour_layer(layers, timestamp):
+    """Choose OLCI MY for archives and NRT only for the recent rolling window."""
+    archive = layers.get("satellite_chlorophyll")
+    recent = layers.get("satellite_chlorophyll_nrt")
+    if not archive:
+        return None
+    if not recent:
+        return archive
+    try:
+        requested = datetime.datetime.strptime(
+            str(timestamp)[:10], "%Y-%m-%d").date()
+        age_days = (datetime.datetime.utcnow().date()-requested).days
+    except Exception:
+        return archive
+    return recent if -2 <= age_days <= 35 else archive
+
+
 def http_json(url):
     request = urllib.request.Request(
         url, headers={"User-Agent": "MusselFlow-Rhino/"+COMPONENT_BUILD})
@@ -586,6 +566,52 @@ def field_value(properties, kind):
 
 def daily_time(timestamp):
     return str(timestamp)[:10]+"T00:00:00Z"
+
+
+def previous_daily_time(timestamp, days_back):
+    """Return a UTC midnight timestamp a whole number of days earlier."""
+    try:
+        day = datetime.datetime.strptime(str(timestamp)[:10], "%Y-%m-%d")
+    except (TypeError, ValueError):
+        raise ValueError("cannot derive a daily fallback from time: %s" % timestamp)
+    day -= datetime.timedelta(days=int(days_back))
+    return day.strftime("%Y-%m-%dT00:00:00Z")
+
+
+def representative_samples(samples, maximum=5):
+    """Choose a small spatial spread for inexpensive date-availability probes."""
+    if len(samples) <= maximum:
+        return list(samples)
+    last = len(samples)-1
+    indices = sorted(set(
+        int(round(last*step/float(maximum-1))) for step in range(maximum)))
+    return [samples[index] for index in indices]
+
+
+def urls_for_samples(samples, layer, timestamp, depth):
+    return [
+        feature_url(layer, sample["latitude"], sample["longitude"],
+                    timestamp, depth)
+        for sample in samples
+    ]
+
+
+def documents_contain_value(samples, urls, documents, kind):
+    """True when at least one representative point has a physical value."""
+    for sample, url in zip(samples, urls):
+        properties = feature_properties(documents.get(url, {}))
+        if field_value(properties, kind) is not None:
+            return True
+    return False
+
+
+def apply_documents(samples, urls, documents, kind):
+    """Attach source values and coordinates to a complete spatial sample set."""
+    for sample, url in zip(samples, urls):
+        properties = feature_properties(documents.get(url, {}))
+        sample["value"] = field_value(properties, kind)
+        sample["source_latitude"] = finite_number(properties.get("lat"))
+        sample["source_longitude"] = finite_number(properties.get("lon"))
 
 
 def default_colors():
@@ -721,8 +747,8 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             siteData: str,
             domain: Rhino.Geometry.Curve,
             variable: str,
-            timeIndex: str,
-            depth: object,
+            timeIndex: object,
+            depth: float,
             resolution: int,
             sizePower: float,
             colors: list[System.Drawing.Color],
@@ -738,17 +764,21 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                     "unknown variable '%s'. Choose: %s" % (
                         selected_variable, ", ".join(sorted(VARIABLES))))
             specification = VARIABLES[selected_variable]
-            layer = site["layers"].get(specification["layer"])
+            index, time_selection_mode = resolve_frame(timeIndex, frames)
+            requested_timestamp = str(frames[index].get("time_utc") or "")
+            if not requested_timestamp:
+                raise ValueError("selected SiteData frame has no timestamp.")
+            if specification["daily"]:
+                requested_timestamp = daily_time(requested_timestamp)
+            if selected_variable == "satellite_chlorophyll":
+                layer = ocean_colour_layer(site["layers"], requested_timestamp)
+            else:
+                layer = site["layers"].get(specification["layer"])
             if not layer:
                 raise ValueError(
                     "siteData regional catalogue has no '%s' layer."
                     % specification["layer"])
-            index, frame_timestamp, time_selection = select_frame(
-                frames, timeIndex)
-            timestamp = (
-                daily_time(frame_timestamp)
-                if specification["daily"] else frame_timestamp)
-            sample_depth = depth_metres(depth)
+            sample_depth = abs(finite_number(depth) or 0.0)
             count = 12 if resolution is None else int(resolution)
             count = max(4, min(24, count))
             power = finite_number(sizePower)
@@ -778,28 +808,68 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         except Exception as exception:
             return empty_outputs("INVALID_INPUT", str(exception))
 
-        urls = []
-        for sample in samples:
-            query_depth = None if specification["surface"] else sample_depth
-            url = feature_url(
-                layer, sample["latitude"], sample["longitude"],
-                timestamp, query_depth)
-            sample["url"] = url
-            urls.append(url)
+        query_depth = None if specification["surface"] else sample_depth
+        lookback_days = int(specification.get("lookback_days") or 0)
+        candidate_times = [requested_timestamp]
+        candidate_times.extend(
+            previous_daily_time(requested_timestamp, offset)
+            for offset in range(1, lookback_days+1))
+        probes = representative_samples(samples)
+        timestamp = None
+        fallback_days = None
+        errors = {}
+        missing_before = 0
+        cached_before = 0
 
-        documents, errors, missing_before, cached_before = fetch_urls(urls, bool(fetch))
-        if missing_before and not fetch:
+        for offset, candidate_time in enumerate(candidate_times):
+            probe_urls = urls_for_samples(
+                probes, layer, candidate_time, query_depth)
+            probe_documents, probe_errors, missing, cached = fetch_urls(
+                probe_urls, bool(fetch))
+            errors.update(probe_errors)
+            missing_before += missing
+            cached_before += cached
+            if missing and not fetch:
+                return empty_outputs(
+                    "WAITING",
+                    "Press the fetch Button once. %d availability probe(s) "
+                    "are not cached." % missing)
+            if not documents_contain_value(
+                    probes, probe_urls, probe_documents,
+                    specification["kind"]):
+                continue
+
+            urls = urls_for_samples(
+                samples, layer, candidate_time, query_depth)
+            documents, full_errors, missing, cached = fetch_urls(
+                urls, bool(fetch))
+            errors.update(full_errors)
+            missing_before += missing
+            cached_before += cached
+            if missing and not fetch:
+                return empty_outputs(
+                    "WAITING",
+                    "The date is available. Press the fetch Button once for "
+                    "%d uncached field sample(s)." % missing)
+            apply_documents(
+                samples, urls, documents, specification["kind"])
+            timestamp = candidate_time
+            fallback_days = offset
+            break
+
+        if timestamp is None:
+            detail = ""
+            if errors:
+                detail = " First HTTP error: "+next(iter(errors.values()))
+            search_text = (
+                "requested date only" if lookback_days == 0
+                else "%d daily dates (%s through %s)" % (
+                    len(candidate_times), candidate_times[0],
+                    candidate_times[-1]))
             return empty_outputs(
-                "WAITING",
-                "Press the fetch Button once. %d unique API samples are not cached."
-                % missing_before)
-
-        for sample in samples:
-            properties = feature_properties(documents.get(sample["url"], {}))
-            sample["value"] = field_value(properties, specification["kind"])
-            sample["source_latitude"] = finite_number(properties.get("lat"))
-            sample["source_longitude"] = finite_number(properties.get("lon"))
-            sample.pop("url", None)
+                "NO_DATA",
+                "No valid %s values were returned after searching %s.%s"
+                % (selected_variable, search_text, detail))
 
         valid_samples, low, high = normalize_samples(samples)
         if not valid_samples:
@@ -821,9 +891,13 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             "build": COMPONENT_BUILD,
             "variable": selected_variable,
             "units": specification["units"],
+            "data_source": specification.get("source", "Copernicus regional product"),
+            "nominal_resolution_m": specification.get("nominal_resolution_m"),
             "time_utc": timestamp,
+            "requested_time_utc": requested_timestamp,
+            "time_fallback_days": fallback_days,
             "source_frame_index": index,
-            "source_frame_time_utc": frame_timestamp,
+            "time_selection_mode": time_selection_mode,
             "depth_m": None if specification["surface"] else sample_depth,
             "regional_product": region,
             "anchor": {"latitude": anchor_lat, "longitude": anchor_lon},
@@ -870,10 +944,16 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         }
         legend = [
             "VARIABLE | %s" % selected_variable,
+            "SOURCE | %s" % specification.get(
+                "source", "Copernicus regional product"),
+            "NOMINAL RESOLUTION | %s" % (
+                "not declared" if specification.get("nominal_resolution_m") is None
+                else "%.6g m" % specification["nominal_resolution_m"]),
             "UNITS | %s" % specification["units"],
             "RAW RANGE | %.6g to %.6g" % (low, high),
             "DISPLAY | linear colour; hotspot radius = normalized^%.3g" % power,
             "TIME | %s" % timestamp,
+            "REQUESTED TIME | %s" % requested_timestamp,
             "DEPTH | %s" % (
                 "surface product" if specification["surface"]
                 else "%.6g m" % sample_depth),
@@ -892,8 +972,23 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             "SOURCE CELLS | %d distinct Copernicus cells represented"
             % unique_cells,
             "TIME SELECTION | %s | frame %d | %s"
-            % (time_selection, index, frame_timestamp),
+            % (time_selection_mode, index, requested_timestamp),
         ]
+        if fallback_days:
+            report.append(
+                "TIME FALLBACK | requested %s | used %s | %d day(s) earlier"
+                % (requested_timestamp, timestamp, fallback_days))
+        elif lookback_days:
+            report.append(
+                "TIME FALLBACK | exact requested daily observation available")
+        if selected_variable == "chlorophyll":
+            report.append(
+                "SOURCE MODE | depth-aware regional BGC model | nominal 7 km; "
+                "use satellite_chlorophyll for the 300 m Sentinel-3 OLCI surface field.")
+        elif selected_variable == "satellite_chlorophyll":
+            report.append(
+                "SOURCE MODE | Sentinel-3A/B OLCI open-ocean colour | nominal 300 m | "
+                "surface only; depth input ignored.")
         if unit_warning:
             report.append("UNIT WARNING | "+unit_warning)
         if unique_cells <= 1 and len(valid_samples) > 1:
