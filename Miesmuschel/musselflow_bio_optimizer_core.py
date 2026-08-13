@@ -31,7 +31,10 @@ import math
 
 import numpy as np
 
-from musselflow_ecogrammar_core import resolved_lists
+try:
+    from .ecogrammar_core import resolved_lists
+except (ImportError, ValueError):
+    from musselflow_ecogrammar_core import resolved_lists
 
 
 O2_MG_PER_ML = 1.42903
