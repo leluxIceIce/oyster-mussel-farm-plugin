@@ -131,9 +131,11 @@ BALTIC_LAYERS = {
         "cmems_obs_oc_bal_bgc_tur-spm-chl_nrt_l4-hr-mosaic_"
         "P1D-m_202107/SPM"),
     "satellite_chlorophyll": (
-        "OCEANCOLOUR_BAL_BGC_HR_L4_NRT_009_208/"
-        "cmems_obs_oc_bal_bgc_tur-spm-chl_nrt_l4-hr-mosaic_"
-        "P1D-m_202107/CHL"),
+        "OCEANCOLOUR_BAL_BGC_L3_MY_009_133/"
+        "cmems_obs-oc_bal_bgc-plankton_my_l3-olci-300m_P1D-m/CHL"),
+    "satellite_chlorophyll_nrt": (
+        "OCEANCOLOUR_BAL_BGC_L3_NRT_009_131/"
+        "cmems_obs-oc_bal_bgc-plankton_nrt_l3-olci-300m_P1D/CHL"),
     "turbidity": (
         "OCEANCOLOUR_BAL_BGC_HR_L4_NRT_009_208/"
         "cmems_obs_oc_bal_bgc_tur-spm-chl_nrt_l4-hr-mosaic_"
@@ -171,9 +173,11 @@ NORTHWEST_SHELF_LAYERS = {
         "cmems_obs_oc_nws_bgc_tur-spm-chl_nrt_l3-hr-mosaic_"
         "P1D-m_202107/SPM"),
     "satellite_chlorophyll": (
-        "OCEANCOLOUR_NWS_BGC_HR_L3_NRT_009_203/"
-        "cmems_obs_oc_nws_bgc_tur-spm-chl_nrt_l3-hr-mosaic_"
-        "P1D-m_202107/CHL"),
+        "OCEANCOLOUR_ATL_BGC_L3_MY_009_113/"
+        "cmems_obs-oc_atl_bgc-plankton_my_l3-olci-300m_P1D/CHL"),
+    "satellite_chlorophyll_nrt": (
+        "OCEANCOLOUR_ATL_BGC_L3_NRT_009_111/"
+        "cmems_obs-oc_atl_bgc-plankton_nrt_l3-olci-300m_P1D/CHL"),
     "turbidity": (
         "OCEANCOLOUR_NWS_BGC_HR_L3_NRT_009_203/"
         "cmems_obs_oc_nws_bgc_tur-spm-chl_nrt_l3-hr-mosaic_"
@@ -470,6 +474,21 @@ def feature_url(layer, latitude, longitude, timestamp, depth=None):
     if depth is not None:
         query["elevation"] = str(-abs(float(depth)))
     return WMTS_ENDPOINT+"?"+urllib.parse.urlencode(query)
+
+
+def ocean_colour_layer(layers, timestamp):
+    """Choose OLCI MY for archives and NRT only for the recent rolling window."""
+    archive = layers["satellite_chlorophyll"]
+    recent = layers.get("satellite_chlorophyll_nrt")
+    if not recent:
+        return archive
+    try:
+        requested = datetime.datetime.strptime(
+            str(timestamp)[:10], "%Y-%m-%d").date()
+        age_days = (datetime.datetime.utcnow().date()-requested).days
+    except Exception:
+        return archive
+    return recent if -2 <= age_days <= 35 else archive
 
 
 def url_summary(url):
@@ -942,7 +961,7 @@ def fetch_site(latitude, longitude, start, end, depths, count,
                 layers["turbidity"], sampled_latitude, sampled_longitude,
                 daily_time),
             "satellite_chlorophyll": feature_url(
-                layers["satellite_chlorophyll"], sampled_latitude,
+                ocean_colour_layer(layers, daily_time), sampled_latitude,
                 sampled_longitude, daily_time),
         }
         requests.extend(surface_urls.values())
