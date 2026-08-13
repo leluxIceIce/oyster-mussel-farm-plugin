@@ -27,7 +27,8 @@ run : item / bool
 FieldDataJson : list / str
     FieldDataJson outputs from MusselFlow Copernicus Field. Supply one document
     per variable, using the same Rhino domain, grid, timestamp and intended
-    environmental state.
+    environmental state. Recorder placeholders, empty strings and malformed or
+    unrelated JSON documents are skipped and identified in Report.
 targetVariable : item / str
     Variable to predict, for example satellite_chlorophyll. PLS is supervised,
     so this target must be explicit and must vary across source cells.
@@ -82,7 +83,7 @@ import System.Drawing
 import numpy as np
 
 
-COMPONENT_BUILD = "2026-08-13a"
+COMPONENT_BUILD = "2026-08-13b"
 MIN_EFFECTIVE_OBSERVATIONS = 8
 MIN_LOCAL_OBSERVATIONS = 6
 
@@ -96,7 +97,7 @@ COMPONENT_METADATA = {
 
 INPUT_METADATA = (
     ("run", "run", "True fits PLS and then constructs the 2.5D lattice."),
-    ("FieldDataJson", "Fields", "List of aligned FieldDataJson outputs, one per variable."),
+    ("FieldDataJson", "Fields", "Aligned Site Field JSON documents. Empty, malformed and unrelated Recorder entries are skipped and reported."),
     ("targetVariable", "target", "Explicit response variable predicted by PLS, for example satellite_chlorophyll."),
     ("maxComponents", "maxComp", "Maximum PLS components; spatial block CV chooses the final count."),
     ("layerSpacing", "Z", "Z distance between variable layers; zero selects an automatic spacing."),
@@ -273,6 +274,40 @@ def parse_field(document, index):
         "records": parsed,
     }
 
+
+def valid_field_inputs(values):
+    """Return parsed Site Field documents and rejection records.
+
+    Grasshopper Recorders often preserve empty placeholders such as an empty
+    JSON object or unrelated status strings. Those are not statistical
+    observations and must not invalidate otherwise usable fields. Original
+    input indices are retained so Report identifies every ignored entry.
+    """
+    sources = as_list(values)
+    accepted = []
+    skipped = []
+    for source_index, source in enumerate(sources):
+        if source is None or not str(source).strip():
+            skipped.append({
+                "index": source_index,
+                "reason": "empty input",
+            })
+            continue
+        try:
+            document = json_object(source, source_index)
+            field = parse_field(document, source_index)
+        except Exception as exception:
+            skipped.append({
+                "index": source_index,
+                "reason": str(exception),
+            })
+            continue
+        accepted.append({
+            "index": source_index,
+            "document": document,
+            "field": field,
+        })
+    return sources, accepted, skipped
 
 def unique_field_names(fields):
     counts = {}
@@ -730,16 +765,19 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         if not run:
             return empty_outputs("WAITING", "Set run to True to calculate.")
         try:
-            sources = [value for value in as_list(FieldDataJson)
-                       if value is not None and str(value).strip()]
-            if len(sources) < 3:
+            sources, accepted_inputs, skipped_inputs = valid_field_inputs(
+                FieldDataJson)
+            fields = [item["field"] for item in accepted_inputs]
+            if len(fields) < 3:
+                reasons = " | ".join(
+                    "[%d] %s" % (item["index"], item["reason"])
+                    for item in skipped_inputs)
                 raise ValueError(
-                    "connect at least three FieldDataJson documents: one target "
-                    "and at least two candidate predictors.")
-            documents = [json_object(source, index)
-                         for index, source in enumerate(sources)]
-            fields = [parse_field(document, index)
-                      for index, document in enumerate(documents)]
+                    "need at least three valid MusselFlow Site Field documents "
+                    "(one target and two predictors); received %d input(s), "
+                    "accepted %d, skipped %d.%s"
+                    % (len(sources), len(fields), len(skipped_inputs),
+                       "" if not reasons else " SKIPPED | "+reasons))
             labels = unique_field_names(fields)
             target = target_index(labels, targetVariable)
             sample_ids, display_matrix, unmatched = align_fields(fields)
@@ -848,6 +886,13 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 "layer_spacing_rhino_units": z_step,
                 "display_only": True,
             },
+            "input_filter": {
+                "received": len(sources),
+                "accepted": len(accepted_inputs),
+                "accepted_original_indices": [
+                    item["index"] for item in accepted_inputs],
+                "skipped": skipped_inputs,
+            },
             "scientific_status": "EXPLORATORY_SPATIAL_ASSOCIATION_NOT_CAUSATION_OR_SUPER_RESOLUTION",
         }
         link_counts = [len(link_records_for_branch)
@@ -878,7 +923,12 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             "LATTICE FILTER | target plus PLS-retained predictors: %s"
             % " | ".join(labels[index] for index in displayed),
             "SOURCE-CELL GUARD | preview duplicates were collapsed by the target's Copernicus source cell.",
+            "INPUT FILTER | %d received | %d valid Site Field document(s) | %d skipped"
+            % (len(sources), len(accepted_inputs), len(skipped_inputs)),
         ]
+        report.extend(
+            "SKIPPED INPUT [%d] | %s" % (item["index"], item["reason"])
+            for item in skipped_inputs)
         if excluded_labels:
             report.append("CONSTANT PREDICTORS EXCLUDED | "+" | ".join(excluded_labels))
         if len(times) > 1:
