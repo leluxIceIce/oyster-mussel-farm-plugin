@@ -2,13 +2,15 @@
 MusselFlow Copernicus Field — Georeferenced Environmental Preview
 =================================================================
 
-Samples one physical variable from a MusselFlow SiteData JSON document across a
-closed Rhino domain. It preserves the WGS84 anchor and physical source values,
-then creates coloured field cells and hotspot geometry for spatial comparison.
+Turns one Copernicus field into a georeferenced Rhino tile for rapid site
+exploration. It preserves the WGS84 anchor and physical source values, then draws
+coloured cells and value-scaled circles directly in the document.
 
-The component distinguishes depth-aware regional model fields from surface-only
-ocean-colour observations. Its HTTP backend uses Rhino's bundled Python standard
-library, allowing the same data contract to be reused on Windows and macOS.
+Two modes keep exploration responsive without weakening analysis. With
+exportFieldData off, the component uses a source-faithful preview query grid and
+skips the large canonical record document. With exportFieldData on, it restores
+the full WMTS query level and emits the ML/PLS-ready FieldDataJson. The HTTP
+backend uses Rhino's bundled Python standard library on Windows and macOS.
 
 Name: MusselFlow Copernicus Field
 Updated: 260813
@@ -39,7 +41,7 @@ timeIndex : item / object
 depth : item / float
     Positive sampling depth in metres. Surface products ignore this value.
 resolution : item / int
-    Cells along the domain's longer side, clamped to 4-24. Twelve is recommended.
+    Cells along the longer side. Fast explore clamps to 4-8; analysis export to 4-24.
 sizePower : item / float
     Hotspot radius exponent. 1 is linear; 2 strongly emphasizes high values.
 colors : list / System.Drawing.Color
@@ -51,6 +53,10 @@ placementPoint : item / Rhino.Geometry.Point3d
     Optional Rhino point at which the centre of the visualized tile is placed.
     This translates preview geometry only; it never changes the SiteData
     latitude/longitude used for Copernicus sampling.
+exportFieldData : item / bool
+    False is fast exploration: draw the field and return "{}" from FieldDataJson.
+    True is analysis export: use the full query level and build canonical records
+    for the PLS/ML pipeline.
 
 Data distinction:
     The component samples processed Copernicus model or ocean-colour products.
@@ -73,7 +79,7 @@ Values : list / float
 Normalized : list / float
     Display-only values from 0 to 1.
 FieldDataJson : item / str
-    Canonical ML-ready JSON with requested/source coordinates and raw values.
+    Canonical ML/PLS-ready records when exportFieldData is True; otherwise "{}".
 Legend : list / str
     Variable, source units, raw range, display transform, time, and depth.
 Report : list / str
@@ -83,7 +89,7 @@ SDK setup
 ---------
 Create a Rhino 8 Python 3 component, convert the default component with
 ``Convert To GH_ScriptInstance``, then replace its generated text with this
-complete file. The RunScript annotations create and type-hint the eleven inputs.
+complete file. The RunScript annotations create and type-hint the twelve inputs.
 Add nine output sockets once in the exact order above. BeforeRunScript applies
 all names and human-readable hover tooltips.
 """
@@ -102,13 +108,17 @@ import Rhino
 import System.Drawing
 
 
-COMPONENT_BUILD = "2026-08-13b"
+COMPONENT_BUILD = "2026-08-14a"
 WMTS_ENDPOINT = "https://wmts.marine.copernicus.eu/teroWmts/"
-TILE_LEVEL = 10
+ANALYSIS_TILE_LEVEL = 10
+EXPLORE_REGIONAL_TILE_LEVEL = 4
+EXPLORE_SURFACE_TILE_LEVEL = 8
 HTTP_TIMEOUT_S = 25
-MAX_WORKERS = 8
+MAX_WORKERS = 16
 MAX_SAMPLES = 576
 SATELLITE_LOOKBACK_DAYS = 30
+EXPLORE_AVAILABILITY_PROBES = 2
+ANALYSIS_AVAILABILITY_PROBES = 5
 
 VARIABLES = {
     "current_speed": {
@@ -210,11 +220,12 @@ INPUT_METADATA = (
     ("variable", "variable", "Field name. For chlorophyll: satellite_chlorophyll = 300 m surface Sentinel-3 OLCI; chlorophyll = depth-aware regional model."),
     ("timeIndex", "timeIndex", "Integer frame index or exact SiteData timestamp. Missing daily satellite data searches backward up to 30 days."),
     ("depth", "depth", "Positive depth in metres; ignored by surface satellite products."),
-    ("resolution", "resolution", "Grid cells along the longer domain side, 4-24; twelve recommended."),
+    ("resolution", "resolution", "Cells along the longer side: fast explore 4-8; analysis export 4-24."),
     ("sizePower", "sizePower", "Hotspot radius exponent; 2 emphasizes high values."),
     ("colors", "colors", "Optional ordered System.Drawing colour stops, low to high."),
     ("northVector", "northVector", "Geographic north in the Rhino domain plane; defaults to World +Y."),
     ("placementPoint", "placementPoint", "Optional Rhino point for the displayed tile centre; geospatial sampling is unchanged."),
+    ("exportFieldData", "exportFieldData", "False: fast visual exploration. True: full-resolution canonical FieldDataJson for PLS/ML."),
 )
 
 OUTPUT_METADATA = (
@@ -224,7 +235,7 @@ OUTPUT_METADATA = (
     ("Points", "Points", "Rhino sample points matching Values and Normalized."),
     ("Values", "Values", "Raw physical values in the Legend units."),
     ("Normalized", "Normalized", "Display-only values in the interval 0-1."),
-    ("FieldDataJson", "FieldData", "Canonical spatial field records for export or later ML."),
+    ("FieldDataJson", "FieldData", "Canonical records only when exportFieldData is True; otherwise {}."),
     ("Legend", "Legend", "Variable, units, range, timestamp, and display mapping."),
     ("Report", "Report", "Request/cache state, coverage, warnings, and scientific scope."),
 )
@@ -482,14 +493,15 @@ def wmts_position(latitude, longitude, level=TILE_LEVEL):
     return row, column, pixel_x, pixel_y
 
 
-def feature_url(layer, latitude, longitude, timestamp, depth=None):
-    row, column, pixel_x, pixel_y = wmts_position(latitude, longitude)
+def feature_url(layer, latitude, longitude, timestamp, depth=None, level=ANALYSIS_TILE_LEVEL):
+    row, column, pixel_x, pixel_y = wmts_position(
+        latitude, longitude, level=level)
     query = {
         "service": "WMTS",
         "request": "GetFeatureInfo",
         "layer": layer,
         "tilematrixset": "EPSG:4326",
-        "tilematrix": str(TILE_LEVEL),
+        "tilematrix": str(level),
         "tilerow": str(row),
         "tilecol": str(column),
         "i": str(pixel_x),
@@ -588,10 +600,11 @@ def representative_samples(samples, maximum=5):
     return [samples[index] for index in indices]
 
 
-def urls_for_samples(samples, layer, timestamp, depth):
+def urls_for_samples(samples, layer, timestamp, depth, level):
     return [
-        feature_url(layer, sample["latitude"], sample["longitude"],
-                    timestamp, depth)
+        feature_url(
+            layer, sample["latitude"], sample["longitude"],
+            timestamp, depth, level)
         for sample in samples
     ]
 
@@ -744,7 +757,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
     def RunScript(
             self,
             fetch: bool,
-            siteData: str,
+            SiteDataJson: str,
             domain: Rhino.Geometry.Curve,
             variable: str,
             timeIndex: object,
@@ -753,17 +766,26 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             sizePower: float,
             colors: list[System.Drawing.Color],
             northVector: Rhino.Geometry.Vector3d,
-            placementPoint: Rhino.Geometry.Point3d):
-        """Sample and preview one physical Copernicus field."""
+            placementPoint: Rhino.Geometry.Point3d,
+            exportFieldData: bool):
+        """Preview one field quickly; optionally export canonical analysis records."""
         started = time.perf_counter()
         try:
-            site, anchor_lat, anchor_lon, frames = parse_site_data(siteData)
+            site, anchor_lat, anchor_lon, frames = parse_site_data(SiteDataJson)
             selected_variable = variable_name(variable)
             if selected_variable not in VARIABLES:
                 raise ValueError(
                     "unknown variable '%s'. Choose: %s" % (
                         selected_variable, ", ".join(sorted(VARIABLES))))
             specification = VARIABLES[selected_variable]
+            export_enabled = bool(exportFieldData)
+            query_level = (
+                ANALYSIS_TILE_LEVEL if export_enabled else
+                EXPLORE_SURFACE_TILE_LEVEL if specification["surface"] else
+                EXPLORE_REGIONAL_TILE_LEVEL)
+            probe_budget = (
+                ANALYSIS_AVAILABILITY_PROBES if export_enabled else
+                EXPLORE_AVAILABILITY_PROBES)
             index, time_selection_mode = resolve_frame(timeIndex, frames)
             requested_timestamp = str(frames[index].get("time_utc") or "")
             if not requested_timestamp:
@@ -779,8 +801,9 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                     "siteData regional catalogue has no '%s' layer."
                     % specification["layer"])
             sample_depth = abs(finite_number(depth) or 0.0)
-            count = 12 if resolution is None else int(resolution)
-            count = max(4, min(24, count))
+            count = (12 if export_enabled else 8) if resolution is None else int(resolution)
+            count_limit = 24 if export_enabled else 8
+            count = max(4, min(count_limit, count))
             power = finite_number(sizePower)
             power = 2.0 if power is None else min(4.0, max(0.25, power))
             if domain is None or not isinstance(domain, Rhino.Geometry.Curve):
@@ -814,33 +837,47 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         candidate_times.extend(
             previous_daily_time(requested_timestamp, offset)
             for offset in range(1, lookback_days+1))
-        probes = representative_samples(samples)
+        availability_started = time.perf_counter()
+        probes = representative_samples(samples, maximum=probe_budget)
         timestamp = None
         fallback_days = None
         errors = {}
         missing_before = 0
         cached_before = 0
 
+        probe_plans = []
+        all_probe_urls = []
         for offset, candidate_time in enumerate(candidate_times):
-            probe_urls = urls_for_samples(
-                probes, layer, candidate_time, query_depth)
-            probe_documents, probe_errors, missing, cached = fetch_urls(
-                probe_urls, bool(fetch))
-            errors.update(probe_errors)
-            missing_before += missing
-            cached_before += cached
-            if missing and not fetch:
-                return empty_outputs(
-                    "WAITING",
-                    "Press the fetch Button once. %d availability probe(s) "
-                    "are not cached." % missing)
-            if not documents_contain_value(
-                    probes, probe_urls, probe_documents,
-                    specification["kind"]):
-                continue
+            candidate_urls = urls_for_samples(
+                probes, layer, candidate_time, query_depth, query_level)
+            probe_plans.append((offset, candidate_time, candidate_urls))
+            all_probe_urls.extend(candidate_urls)
 
+        probe_documents, probe_errors, missing, cached = fetch_urls(
+            all_probe_urls, bool(fetch))
+        errors.update(probe_errors)
+        missing_before += missing
+        cached_before += cached
+        if missing and not fetch:
+            return empty_outputs(
+                "WAITING",
+                "Press the fetch Button once. %d availability request(s) "
+                "are not cached." % missing)
+
+        for offset, candidate_time, candidate_urls in probe_plans:
+            if documents_contain_value(
+                    probes, candidate_urls, probe_documents,
+                    specification["kind"]):
+                timestamp = candidate_time
+                fallback_days = offset
+                break
+        availability_seconds = time.perf_counter()-availability_started
+
+        if timestamp is not None:
+            field_started = time.perf_counter()
             urls = urls_for_samples(
-                samples, layer, candidate_time, query_depth)
+                samples, layer, timestamp, query_depth, query_level)
+            field_url_count = len(set(urls))
             documents, full_errors, missing, cached = fetch_urls(
                 urls, bool(fetch))
             errors.update(full_errors)
@@ -850,12 +887,13 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 return empty_outputs(
                     "WAITING",
                     "The date is available. Press the fetch Button once for "
-                    "%d uncached field sample(s)." % missing)
+                    "%d uncached field request(s)." % missing)
             apply_documents(
                 samples, urls, documents, specification["kind"])
-            timestamp = candidate_time
-            fallback_days = offset
-            break
+            field_seconds = time.perf_counter()-field_started
+        else:
+            field_url_count = 0
+            field_seconds = 0.0
 
         if timestamp is None:
             detail = ""
@@ -881,67 +919,76 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 "No valid %s values were returned for this domain/time/depth.%s"
                 % (selected_variable, detail))
 
+        geometry_started = time.perf_counter()
         stops = color_stops(colors)
         field_mesh, hotspot_mesh, circles, points, values, normalized = (
             make_geometry(valid_samples, display_plane, du, dv, power, stops))
+        geometry_seconds = time.perf_counter()-geometry_started
         unique_cells = source_cell_count(valid_samples)
         region = site.get("regional_product") or {}
-        field_document = {
-            "schema": "musselflow.site_field.1.0.0",
-            "build": COMPONENT_BUILD,
-            "variable": selected_variable,
-            "units": specification["units"],
-            "data_source": specification.get("source", "Copernicus regional product"),
-            "nominal_resolution_m": specification.get("nominal_resolution_m"),
-            "time_utc": timestamp,
-            "requested_time_utc": requested_timestamp,
-            "time_fallback_days": fallback_days,
-            "source_frame_index": index,
-            "time_selection_mode": time_selection_mode,
-            "depth_m": None if specification["surface"] else sample_depth,
-            "regional_product": region,
-            "anchor": {"latitude": anchor_lat, "longitude": anchor_lon},
-            "placement_point_rhino": {
-                "x": display_anchor.X,
-                "y": display_anchor.Y,
-                "z": display_anchor.Z,
-            },
-            "domain_size_m": {"width": width_m, "height": height_m},
-            "grid": {
-                "columns": nx,
-                "rows": ny,
-                "inside_samples": len(samples),
-                "valid_samples": len(valid_samples),
-                "unique_source_cells": unique_cells,
-            },
-            "display": {
-                "minimum": low,
-                "maximum": high,
-                "normalization": "linear min-max",
-                "hotspot_radius_power": power,
-            },
-            "records": [
-                {
-                    "sample_id": "%d:%d" % (
-                        sample["row"], sample["column"]),
-                    "row": sample["row"],
-                    "column": sample["column"],
-                    "latitude": sample["latitude"],
-                    "longitude": sample["longitude"],
-                    "source_latitude": sample["source_latitude"],
-                    "source_longitude": sample["source_longitude"],
-                    "value": sample["value"],
-                    "normalized": sample["normalized"],
-                    "rhino_point": {
-                        "x": sample["display_point"].X,
-                        "y": sample["display_point"].Y,
-                        "z": sample["display_point"].Z,
-                    },
-                }
-                for sample in valid_samples
-            ],
-            "scientific_status": "COPERNICUS_DERIVED_FIELD_NOT_SITE_VALIDATED",
-        }
+        json_started = time.perf_counter()
+        if export_enabled:
+            field_document = {
+                "schema": "musselflow.site_field.1.0.0",
+                "build": COMPONENT_BUILD,
+                "variable": selected_variable,
+                "units": specification["units"],
+                "data_source": specification.get("source", "Copernicus regional product"),
+                "nominal_resolution_m": specification.get("nominal_resolution_m"),
+                "time_utc": timestamp,
+                "requested_time_utc": requested_timestamp,
+                "time_fallback_days": fallback_days,
+                "source_frame_index": index,
+                "time_selection_mode": time_selection_mode,
+                "depth_m": None if specification["surface"] else sample_depth,
+                "regional_product": region,
+                "anchor": {"latitude": anchor_lat, "longitude": anchor_lon},
+                "placement_point_rhino": {
+                    "x": display_anchor.X,
+                    "y": display_anchor.Y,
+                    "z": display_anchor.Z,
+                },
+                "domain_size_m": {"width": width_m, "height": height_m},
+                "grid": {
+                    "columns": nx,
+                    "rows": ny,
+                    "inside_samples": len(samples),
+                    "valid_samples": len(valid_samples),
+                    "unique_source_cells": unique_cells,
+                },
+                "display": {
+                    "minimum": low,
+                    "maximum": high,
+                    "normalization": "linear min-max",
+                    "hotspot_radius_power": power,
+                },
+                "records": [
+                    {
+                        "sample_id": "%d:%d" % (
+                            sample["row"], sample["column"]),
+                        "row": sample["row"],
+                        "column": sample["column"],
+                        "latitude": sample["latitude"],
+                        "longitude": sample["longitude"],
+                        "source_latitude": sample["source_latitude"],
+                        "source_longitude": sample["source_longitude"],
+                        "value": sample["value"],
+                        "normalized": sample["normalized"],
+                        "rhino_point": {
+                            "x": sample["display_point"].X,
+                            "y": sample["display_point"].Y,
+                            "z": sample["display_point"].Z,
+                        },
+                    }
+                    for sample in valid_samples
+                ],
+                "scientific_status": "COPERNICUS_DERIVED_FIELD_NOT_SITE_VALIDATED",
+            }
+    
+            field_data_json = canonical_json(field_document)
+        else:
+            field_data_json = "{}"
+        json_seconds = time.perf_counter()-json_started
         legend = [
             "VARIABLE | %s" % selected_variable,
             "SOURCE | %s" % specification.get(
@@ -962,6 +1009,13 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             "MUSSELFLOW SITE FIELD | build %s | %s | %d/%d valid | %.3fs"
             % (COMPONENT_BUILD, selected_variable, len(valid_samples),
                len(samples), time.perf_counter()-started),
+            "MODE | %s | FieldDataJson %s"
+            % ("ANALYSIS EXPORT" if export_enabled else "FAST EXPLORE",
+               "enabled" if export_enabled else "disabled"),
+            "TIMING | availability %.3fs | field %.3fs | geometry %.3fs | json %.3fs"
+            % (availability_seconds, field_seconds, geometry_seconds, json_seconds),
+            "REQUEST PLAN | WMTS level %d | %d unique field request(s) | %d probe point(s)"
+            % (query_level, field_url_count, len(probes)),
             "REGION | %s" % (region.get("name") or "from SiteData catalogue"),
             "DOMAIN | %.3f x %.3f m | grid %d x %d | %d inside"
             % (width_m, height_m, nx, ny, len(samples)),
@@ -1002,13 +1056,17 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         if errors:
             report.append(
                 "HTTP WARNING | failed samples remain holes; no values were invented.")
+        if not export_enabled:
+            report.append(
+                "EXPLORE LIMIT | coarser WMTS query level for navigation only; "
+                "enable exportFieldData before PLS/ML or scientific extraction.")
         report.extend([
             "DATA LIMIT | processed model/ocean-colour product, not raw multispectral bands.",
             "VALIDATION LIMIT | regional fields require product-QC and local observations.",
         ])
         return (
             field_mesh, hotspot_mesh, circles, points, values, normalized,
-            canonical_json(field_document), legend, report)
+            field_data_json, legend, report)
 
     def AfterRunScript(self):
         pass
