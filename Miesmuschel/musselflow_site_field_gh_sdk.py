@@ -481,7 +481,7 @@ def grid_samples(curve, plane, tolerance, resolution, metres_per_unit,
         width*metres_per_unit, height*metres_per_unit, anchor)
 
 
-def wmts_position(latitude, longitude, level=TILE_LEVEL):
+def wmts_position(latitude, longitude, level=ANALYSIS_TILE_LEVEL):
     matrix_width = 2**(level+1)
     matrix_height = 2**level
     x = (longitude+180.0)/360.0*matrix_width
