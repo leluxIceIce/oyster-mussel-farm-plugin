@@ -1,3 +1,4 @@
+# r: copernicusmarine==2.2.4
 """
 MusselFlow Copernicus Field — Georeferenced Environmental Preview
 =================================================================
@@ -6,11 +7,12 @@ Turns one Copernicus field into a georeferenced Rhino tile for rapid site
 exploration. It preserves the WGS84 anchor and physical source values, then draws
 coloured cells and value-scaled circles directly in the document.
 
-The visualization and Copernicus sampling are identical in both output modes.
-exportFieldData controls only whether the canonical FieldDataJson document is
-serialized for the PLS/ML pipeline. Turning it off saves JSON construction; it
-never changes the WMTS level, sample grid, source values, or preview geometry.
-The HTTP backend uses Rhino's bundled Python standard library on Windows and macOS.
+The component converts the complete Rhino boundary into one WGS84 bounding box,
+downloads the native numerical Copernicus grid once, caches that patch, and maps
+any Rhino preview resolution onto it locally. ``exportFieldData`` controls only
+whether the canonical FieldDataJson document is serialized for the PLS/ML
+pipeline; it never changes sampling, source values, or preview geometry. The old
+WMTS point sampler remains a reported compatibility fallback.
 
 Name: MusselFlow Copernicus Field
 Updated: 260816
@@ -107,8 +109,13 @@ import Grasshopper
 import Rhino
 import System.Drawing
 
+try:
+    import copernicusmarine
+except Exception:
+    copernicusmarine = None
 
-COMPONENT_BUILD = "2026-08-16a"
+
+COMPONENT_BUILD = "2026-08-16b"
 WMTS_ENDPOINT = "https://wmts.marine.copernicus.eu/teroWmts/"
 FIELD_TILE_LEVEL = 10
 HTTP_TIMEOUT_S = 25
@@ -206,8 +213,9 @@ COMPONENT_METADATA = {
     "name": "MusselFlow Copernicus Field",
     "nickname": "SiteField",
     "description": (
-        "Sample one Copernicus variable over a georeferenced Rhino domain and "
-        "output coloured hotspot geometry plus ML-ready physical values."),
+        "Download one native Copernicus numerical patch for a georeferenced "
+        "Rhino domain, then resample it locally into coloured geometry and "
+        "ML-ready physical values."),
 }
 
 INPUT_METADATA = (
@@ -217,7 +225,7 @@ INPUT_METADATA = (
     ("variable", "variable", "Field name. For chlorophyll: satellite_chlorophyll = 300 m surface Sentinel-3 OLCI; chlorophyll = depth-aware regional model."),
     ("timeIndex", "timeIndex", "Integer frame index or exact SiteData timestamp. Missing daily satellite data searches backward up to 30 days."),
     ("depth", "depth", "Positive depth in metres; ignored by surface satellite products."),
-    ("resolution", "resolution", "Cells along the longer side, clamped to 4-24 in every output mode."),
+    ("resolution", "resolution", "Local Rhino preview cells along the longer side, clamped to 4-24. This never changes the downloaded native patch."),
     ("sizePower", "sizePower", "Hotspot radius exponent; 2 emphasizes high values."),
     ("colors", "colors", "Optional ordered System.Drawing colour stops, low to high."),
     ("northVector", "northVector", "Geographic north in the Rhino domain plane; defaults to World +Y."),
@@ -238,6 +246,7 @@ OUTPUT_METADATA = (
 )
 
 _HTTP_CACHE = {}
+_PATCH_CACHE = {}
 
 
 def apply_component_metadata(component):
@@ -246,7 +255,7 @@ def apply_component_metadata(component):
     component.Name = COMPONENT_METADATA["name"]
     component.NickName = COMPONENT_METADATA["nickname"]
     component.Description = COMPONENT_METADATA["description"]
-    component.Message = "Copernicus field"
+    component.Message = "Native patch"
     for index, (name, nickname, description) in enumerate(INPUT_METADATA):
         if index >= component.Params.Input.Count:
             break
@@ -452,6 +461,23 @@ def grid_samples(curve, plane, tolerance, resolution, metres_per_unit,
     east_axis, north_axis = projected_north(north_vector, plane)
     longitude_scale = max(
         1e-9, 111320.0*math.cos(math.radians(anchor_latitude)))
+
+    # Georeference the actual boundary, not merely the preview cell centres.
+    # Therefore changing `resolution` cannot change the downloaded source patch.
+    boundary_geo = []
+    for point in boundary:
+        delta = point-anchor
+        east_m = (delta*east_axis)*metres_per_unit
+        north_m = (delta*north_axis)*metres_per_unit
+        boundary_geo.append((
+            anchor_latitude+north_m/111320.0,
+            anchor_longitude+east_m/longitude_scale))
+    field_bbox = {
+        "minimum_latitude": min(item[0] for item in boundary_geo),
+        "maximum_latitude": max(item[0] for item in boundary_geo),
+        "minimum_longitude": min(item[1] for item in boundary_geo),
+        "maximum_longitude": max(item[1] for item in boundary_geo),
+    }
     samples = []
     for row in range(ny):
         v = v_min+(row+0.5)*dv
@@ -475,7 +501,214 @@ def grid_samples(curve, plane, tolerance, resolution, metres_per_unit,
             })
     return (
         samples, nx, ny, du, dv,
-        width*metres_per_unit, height*metres_per_unit, anchor)
+        width*metres_per_unit, height*metres_per_unit, anchor, field_bbox)
+
+
+def layer_contract(layer, kind):
+    """Translate PRODUCT/DATASET/WMTS_VARIABLE into a Toolbox request."""
+    parts = [part for part in str(layer or "").split("/") if part]
+    if len(parts) < 3:
+        raise ValueError("Copernicus layer is not PRODUCT/DATASET/VARIABLE.")
+    dataset_id = parts[-2]
+    wmts_variable = parts[-1]
+    if kind == "vector_speed":
+        variables = ["uo", "vo"]
+    else:
+        variables = [wmts_variable]
+    return dataset_id, variables
+
+
+def patch_time_window(requested_timestamp, lookback_days):
+    end = str(requested_timestamp)
+    if int(lookback_days or 0) <= 0:
+        return end, end
+    return previous_daily_time(end, int(lookback_days)), end
+
+
+def patch_cache_key(dataset_id, variables, field_bbox, start_time, end_time, depth):
+    return (
+        dataset_id,
+        tuple(variables),
+        round(field_bbox["minimum_longitude"], 8),
+        round(field_bbox["maximum_longitude"], 8),
+        round(field_bbox["minimum_latitude"], 8),
+        round(field_bbox["maximum_latitude"], 8),
+        str(start_time),
+        str(end_time),
+        None if depth is None else round(float(depth), 4),
+    )
+
+
+def dataframe_column(frame, candidates):
+    lookup = {str(column).lower(): column for column in frame.columns}
+    for candidate in candidates:
+        if candidate.lower() in lookup:
+            return lookup[candidate.lower()]
+    return None
+
+
+def iso_time(value):
+    if value is None:
+        return ""
+    try:
+        text = value.isoformat()
+    except Exception:
+        text = str(value)
+    text = text.replace("+00:00", "Z")
+    if text.endswith(".000000000"):
+        text = text[:-10]
+    return text
+
+
+def timestamp_number(value):
+    text = normalize_timestamp(value)
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except Exception:
+        try:
+            return datetime.datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+        except Exception:
+            return None
+
+
+def dataframe_records(frame, variables, kind, requested_timestamp, depth):
+    """Extract one latest valid native grid from a Toolbox DataFrame."""
+    if frame is None or len(frame.index) == 0:
+        return [], None
+    table = frame.reset_index()
+    latitude_column = dataframe_column(table, ("latitude", "lat"))
+    longitude_column = dataframe_column(table, ("longitude", "lon"))
+    time_column = dataframe_column(table, ("time", "datetime", "date"))
+    depth_column = dataframe_column(table, ("depth", "elevation"))
+    if latitude_column is None or longitude_column is None:
+        raise ValueError("native patch has no latitude/longitude coordinates.")
+
+    variable_columns = []
+    for variable in variables:
+        column = dataframe_column(table, (variable,))
+        if column is None:
+            raise ValueError("native patch is missing variable '%s'." % variable)
+        variable_columns.append(column)
+
+    rows = []
+    for _, row in table.iterrows():
+        latitude = finite_number(row[latitude_column])
+        longitude = finite_number(row[longitude_column])
+        if latitude is None or longitude is None:
+            continue
+        if kind == "vector_speed":
+            east = finite_number(row[variable_columns[0]])
+            north = finite_number(row[variable_columns[1]])
+            value = None if east is None or north is None else math.hypot(east, north)
+        else:
+            value = finite_number(row[variable_columns[0]])
+            if value is not None and kind == "oxygen":
+                value *= 0.032
+        if value is None:
+            continue
+        row_time = iso_time(row[time_column]) if time_column is not None else str(requested_timestamp)
+        row_depth = finite_number(row[depth_column]) if depth_column is not None else None
+        rows.append({
+            "source_latitude": latitude,
+            "source_longitude": longitude,
+            "source_time": row_time,
+            "source_depth": row_depth,
+            "value": value,
+        })
+    if not rows:
+        return [], None
+
+    # A lookback patch may contain several dates. Use the newest available
+    # observation not later than the requested frame.
+    requested_number = timestamp_number(requested_timestamp)
+    available_times = sorted(set(row["source_time"] for row in rows))
+    eligible = [item for item in available_times
+                if timestamp_number(item) is not None and
+                (requested_number is None or timestamp_number(item) <= requested_number+1.0)]
+    selected_time = eligible[-1] if eligible else available_times[-1]
+    rows = [row for row in rows if row["source_time"] == selected_time]
+
+    # A single requested depth uses the nearest native layer only.
+    if depth is not None:
+        source_depths = sorted(set(
+            row["source_depth"] for row in rows if row["source_depth"] is not None))
+        if source_depths:
+            selected_depth = min(source_depths, key=lambda item: abs(item-float(depth)))
+            rows = [row for row in rows
+                    if row["source_depth"] is None or row["source_depth"] == selected_depth]
+
+    for row in rows:
+        row["source_cell_id"] = "%.8f:%.8f" % (
+            row["source_latitude"], row["source_longitude"])
+    return rows, selected_time
+
+
+def fetch_native_patch(layer, kind, field_bbox, requested_timestamp,
+                       lookback_days, depth, allow_network):
+    dataset_id, variables = layer_contract(layer, kind)
+    start_time, end_time = patch_time_window(requested_timestamp, lookback_days)
+    key = patch_cache_key(
+        dataset_id, variables, field_bbox, start_time, end_time, depth)
+    if key in _PATCH_CACHE:
+        cached = dict(_PATCH_CACHE[key])
+        cached["cache_hit"] = True
+        return cached
+    if not allow_network:
+        raise RuntimeError("native numerical patch is not cached; press fetch once.")
+    if copernicusmarine is None:
+        raise RuntimeError(
+            "copernicusmarine 2.2.4 is unavailable in Rhino Python.")
+
+    arguments = {
+        "dataset_id": dataset_id,
+        "variables": variables,
+        "minimum_longitude": field_bbox["minimum_longitude"],
+        "maximum_longitude": field_bbox["maximum_longitude"],
+        "minimum_latitude": field_bbox["minimum_latitude"],
+        "maximum_latitude": field_bbox["maximum_latitude"],
+        "start_datetime": start_time,
+        "end_datetime": end_time,
+        "coordinates_selection_method": "outside",
+        "disable_progress_bar": True,
+    }
+    if depth is not None:
+        arguments["minimum_depth"] = float(depth)
+        arguments["maximum_depth"] = float(depth)
+
+    frame = copernicusmarine.read_dataframe(**arguments)
+    records, selected_time = dataframe_records(
+        frame, variables, kind, requested_timestamp, depth)
+    if not records:
+        raise ValueError("native numerical patch contains no valid values.")
+    result = {
+        "dataset_id": dataset_id,
+        "variables": variables,
+        "records": records,
+        "selected_time": selected_time,
+        "requested_bbox": dict(field_bbox),
+        "cache_hit": False,
+    }
+    _PATCH_CACHE[key] = dict(result)
+    return result
+
+
+def apply_native_patch(samples, records, anchor_latitude):
+    """Nearest-cell resampling is local; it performs no HTTP operations."""
+    longitude_weight = max(1e-9, math.cos(math.radians(anchor_latitude)))
+    for sample in samples:
+        latitude = sample["latitude"]
+        longitude = sample["longitude"]
+        nearest = min(records, key=lambda record: (
+            (record["source_latitude"]-latitude)**2+
+            ((record["source_longitude"]-longitude)*longitude_weight)**2))
+        sample["value"] = nearest["value"]
+        sample["source_latitude"] = nearest["source_latitude"]
+        sample["source_longitude"] = nearest["source_longitude"]
+        sample["source_time"] = nearest.get("source_time")
+        sample["source_depth"] = nearest.get("source_depth")
+        sample["source_cell_id"] = nearest.get("source_cell_id")
 
 
 def wmts_position(latitude, longitude, level=FIELD_TILE_LEVEL):
@@ -805,7 +1038,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             plane = curve_plane(domain, tolerance)
             if plane is None:
                 raise ValueError("domain curve must be planar.")
-            samples, nx, ny, du, dv, width_m, height_m, domain_anchor = grid_samples(
+            samples, nx, ny, du, dv, width_m, height_m, domain_anchor, field_bbox = grid_samples(
                 domain, plane, tolerance, count, metres_per_unit,
                 anchor_lat, anchor_lon, northVector)
             try:
@@ -824,81 +1057,96 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
 
         query_depth = None if specification["surface"] else sample_depth
         lookback_days = int(specification.get("lookback_days") or 0)
-        candidate_times = [requested_timestamp]
-        candidate_times.extend(
-            previous_daily_time(requested_timestamp, offset)
-            for offset in range(1, lookback_days+1))
-        availability_started = time.perf_counter()
-        probes = representative_samples(samples, maximum=probe_budget)
         timestamp = None
         fallback_days = None
         errors = {}
         missing_before = 0
         cached_before = 0
+        field_url_count = 0
+        availability_seconds = 0.0
+        probes = []
+        backend = "COPERNICUS TOOLBOX NATIVE PATCH"
+        backend_warning = None
 
-        probe_plans = []
-        all_probe_urls = []
-        for offset, candidate_time in enumerate(candidate_times):
-            candidate_urls = urls_for_samples(
-                probes, layer, candidate_time, query_depth, query_level)
-            probe_plans.append((offset, candidate_time, candidate_urls))
-            all_probe_urls.extend(candidate_urls)
-
-        probe_documents, probe_errors, missing, cached = fetch_urls(
-            all_probe_urls, bool(fetch))
-        errors.update(probe_errors)
-        missing_before += missing
-        cached_before += cached
-        if missing and not fetch:
-            return empty_outputs(
-                "WAITING",
-                "Press the fetch Button once. %d availability request(s) "
-                "are not cached." % missing)
-
-        for offset, candidate_time, candidate_urls in probe_plans:
-            if documents_contain_value(
-                    probes, candidate_urls, probe_documents,
-                    specification["kind"]):
-                timestamp = candidate_time
-                fallback_days = offset
-                break
-        availability_seconds = time.perf_counter()-availability_started
-
-        if timestamp is not None:
-            field_started = time.perf_counter()
-            urls = urls_for_samples(
-                samples, layer, timestamp, query_depth, query_level)
-            field_url_count = len(set(urls))
-            documents, full_errors, missing, cached = fetch_urls(
-                urls, bool(fetch))
-            errors.update(full_errors)
-            missing_before += missing
-            cached_before += cached
-            if missing and not fetch:
+        field_started = time.perf_counter()
+        try:
+            patch = fetch_native_patch(
+                layer, specification["kind"], field_bbox,
+                requested_timestamp, lookback_days, query_depth, bool(fetch))
+            apply_native_patch(samples, patch["records"], anchor_lat)
+            timestamp = patch.get("selected_time") or requested_timestamp
+            field_url_count = 1
+            if patch.get("cache_hit"):
+                cached_before = 1
+            else:
+                missing_before = 1
+            requested_number = timestamp_number(requested_timestamp)
+            selected_number = timestamp_number(timestamp)
+            if requested_number is not None and selected_number is not None:
+                fallback_days = max(
+                    0, int(round((requested_number-selected_number)/86400.0)))
+        except Exception as patch_exception:
+            if not fetch:
                 return empty_outputs(
                     "WAITING",
-                    "The date is available. Press the fetch Button once for "
-                    "%d uncached field request(s)." % missing)
-            apply_documents(
-                samples, urls, documents, specification["kind"])
-            field_seconds = time.perf_counter()-field_started
-        else:
-            field_url_count = 0
-            field_seconds = 0.0
+                    "Press fetch once for the native numerical bounding-box patch. %s"
+                    % patch_exception)
 
-        if timestamp is None:
-            detail = ""
-            if errors:
-                detail = " First HTTP error: "+next(iter(errors.values()))
-            search_text = (
-                "requested date only" if lookback_days == 0
-                else "%d daily dates (%s through %s)" % (
-                    len(candidate_times), candidate_times[0],
-                    candidate_times[-1]))
-            return empty_outputs(
-                "NO_DATA",
-                "No valid %s values were returned after searching %s.%s"
-                % (selected_variable, search_text, detail))
+            # Keep the prior point sampler only as a compatibility fallback.
+            # Its use is explicit in Report because it can be much slower.
+            backend = "WMTS GETFEATUREINFO FALLBACK"
+            backend_warning = "%s: %s" % (
+                type(patch_exception).__name__, str(patch_exception))
+            candidate_times = [requested_timestamp]
+            candidate_times.extend(
+                previous_daily_time(requested_timestamp, offset)
+                for offset in range(1, lookback_days+1))
+            availability_started = time.perf_counter()
+            probes = representative_samples(samples, maximum=probe_budget)
+            probe_plans = []
+            all_probe_urls = []
+            for offset, candidate_time in enumerate(candidate_times):
+                candidate_urls = urls_for_samples(
+                    probes, layer, candidate_time, query_depth, query_level)
+                probe_plans.append((offset, candidate_time, candidate_urls))
+                all_probe_urls.extend(candidate_urls)
+            probe_documents, probe_errors, missing, cached = fetch_urls(
+                all_probe_urls, True)
+            errors.update(probe_errors)
+            missing_before += missing
+            cached_before += cached
+            for offset, candidate_time, candidate_urls in probe_plans:
+                if documents_contain_value(
+                        probes, candidate_urls, probe_documents,
+                        specification["kind"]):
+                    timestamp = candidate_time
+                    fallback_days = offset
+                    break
+            availability_seconds = time.perf_counter()-availability_started
+            if timestamp is not None:
+                urls = urls_for_samples(
+                    samples, layer, timestamp, query_depth, query_level)
+                field_url_count = len(set(urls))
+                documents, full_errors, missing, cached = fetch_urls(
+                    urls, True)
+                errors.update(full_errors)
+                missing_before += missing
+                cached_before += cached
+                apply_documents(samples, urls, documents, specification["kind"])
+            else:
+                search_text = (
+                    "requested date only" if lookback_days == 0
+                    else "%d daily dates (%s through %s)" % (
+                        len(candidate_times), candidate_times[0],
+                        candidate_times[-1]))
+                detail = ""
+                if errors:
+                    detail = " First HTTP error: "+next(iter(errors.values()))
+                return empty_outputs(
+                    "NO_DATA",
+                    "No valid %s values were returned after searching %s.%s"
+                    % (selected_variable, search_text, detail))
+        field_seconds = time.perf_counter()-field_started
 
         valid_samples, low, high = normalize_samples(samples)
         if not valid_samples:
@@ -947,6 +1195,11 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                     "valid_samples": len(valid_samples),
                     "unique_source_cells": unique_cells,
                 },
+                "source_patch": {
+                    "backend": backend,
+                    "wgs84_bbox": field_bbox,
+                    "request_count": field_url_count,
+                },
                 "display": {
                     "minimum": low,
                     "maximum": high,
@@ -963,6 +1216,9 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                         "longitude": sample["longitude"],
                         "source_latitude": sample["source_latitude"],
                         "source_longitude": sample["source_longitude"],
+                        "source_time": sample.get("source_time", timestamp),
+                        "source_depth": sample.get("source_depth"),
+                        "source_cell_id": sample.get("source_cell_id"),
                         "value": sample["value"],
                         "normalized": sample["normalized"],
                         "rhino_point": {
@@ -1006,14 +1262,18 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             % ("enabled" if export_enabled else "disabled"),
             "TIMING | availability %.3fs | field %.3fs | geometry %.3fs | json %.3fs"
             % (availability_seconds, field_seconds, geometry_seconds, json_seconds),
-            "REQUEST PLAN | WMTS level %d | %d unique field request(s) | %d probe point(s)"
-            % (query_level, field_url_count, len(probes)),
+            "DATA BACKEND | %s" % backend,
+            "REQUEST PLAN | %d remote patch/request operation(s); preview grid resampled locally"
+            % field_url_count,
+            "WGS84 BBOX | %.8f, %.8f to %.8f, %.8f"
+            % (field_bbox["minimum_longitude"], field_bbox["minimum_latitude"],
+               field_bbox["maximum_longitude"], field_bbox["maximum_latitude"]),
             "REGION | %s" % (region.get("name") or "from SiteData catalogue"),
             "DOMAIN | %.3f x %.3f m | grid %d x %d | %d inside"
             % (width_m, height_m, nx, ny, len(samples)),
             "PLACEMENT | Rhino %.3f, %.3f, %.3f | SiteData WGS84 unchanged"
             % (display_anchor.X, display_anchor.Y, display_anchor.Z),
-            "API | %d uncached before run | %d cached | %d HTTP failures"
+            "CACHE | %d uncached patch/request set(s) | %d cached | %d failures"
             % (missing_before, cached_before, len(errors)),
             "SOURCE CELLS | %d distinct Copernicus cells represented"
             % unique_cells,
@@ -1027,6 +1287,10 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         elif lookback_days:
             report.append(
                 "TIME FALLBACK | exact requested daily observation available")
+        if backend_warning:
+            report.append(
+                "BACKEND WARNING | native patch failed; WMTS point fallback used | "
+                +backend_warning)
         if selected_variable == "chlorophyll":
             report.append(
                 "SOURCE MODE | depth-aware regional BGC model | nominal 7 km; "
