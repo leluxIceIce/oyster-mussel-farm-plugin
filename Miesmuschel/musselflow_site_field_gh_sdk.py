@@ -6,14 +6,14 @@ Turns one Copernicus field into a georeferenced Rhino tile for rapid site
 exploration. It preserves the WGS84 anchor and physical source values, then draws
 coloured cells and value-scaled circles directly in the document.
 
-Two modes keep exploration responsive without weakening analysis. With
-exportFieldData off, the component uses a source-faithful preview query grid and
-skips the large canonical record document. With exportFieldData on, it restores
-the full WMTS query level and emits the ML/PLS-ready FieldDataJson. The HTTP
-backend uses Rhino's bundled Python standard library on Windows and macOS.
+The visualization and Copernicus sampling are identical in both output modes.
+exportFieldData controls only whether the canonical FieldDataJson document is
+serialized for the PLS/ML pipeline. Turning it off saves JSON construction; it
+never changes the WMTS level, sample grid, source values, or preview geometry.
+The HTTP backend uses Rhino's bundled Python standard library on Windows and macOS.
 
 Name: MusselFlow Copernicus Field
-Updated: 260813
+Updated: 260816
 Author: Felix Berger
 Copyright: Apache License 2.0
 
@@ -41,7 +41,7 @@ timeIndex : item / object
 depth : item / float
     Positive sampling depth in metres. Surface products ignore this value.
 resolution : item / int
-    Cells along the longer side. Fast explore clamps to 4-8; analysis export to 4-24.
+    Cells along the longer side, clamped to 4-24 in every output mode.
 sizePower : item / float
     Hotspot radius exponent. 1 is linear; 2 strongly emphasizes high values.
 colors : list / System.Drawing.Color
@@ -54,9 +54,9 @@ placementPoint : item / Rhino.Geometry.Point3d
     This translates preview geometry only; it never changes the SiteData
     latitude/longitude used for Copernicus sampling.
 exportFieldData : item / bool
-    False is fast exploration: draw the field and return "{}" from FieldDataJson.
-    True is analysis export: use the full query level and build canonical records
-    for the PLS/ML pipeline.
+    Controls only the FieldDataJson output. False returns "{}"; True serializes
+    the canonical PLS/ML records. Sampling, values, resolution, and geometry stay
+    identical.
 
 Data distinction:
     The component samples processed Copernicus model or ocean-colour products.
@@ -108,17 +108,14 @@ import Rhino
 import System.Drawing
 
 
-COMPONENT_BUILD = "2026-08-14a"
+COMPONENT_BUILD = "2026-08-16a"
 WMTS_ENDPOINT = "https://wmts.marine.copernicus.eu/teroWmts/"
-ANALYSIS_TILE_LEVEL = 10
-EXPLORE_REGIONAL_TILE_LEVEL = 4
-EXPLORE_SURFACE_TILE_LEVEL = 8
+FIELD_TILE_LEVEL = 10
 HTTP_TIMEOUT_S = 25
 MAX_WORKERS = 16
 MAX_SAMPLES = 576
 SATELLITE_LOOKBACK_DAYS = 30
-EXPLORE_AVAILABILITY_PROBES = 2
-ANALYSIS_AVAILABILITY_PROBES = 5
+AVAILABILITY_PROBES = 3
 
 VARIABLES = {
     "current_speed": {
@@ -220,12 +217,12 @@ INPUT_METADATA = (
     ("variable", "variable", "Field name. For chlorophyll: satellite_chlorophyll = 300 m surface Sentinel-3 OLCI; chlorophyll = depth-aware regional model."),
     ("timeIndex", "timeIndex", "Integer frame index or exact SiteData timestamp. Missing daily satellite data searches backward up to 30 days."),
     ("depth", "depth", "Positive depth in metres; ignored by surface satellite products."),
-    ("resolution", "resolution", "Cells along the longer side: fast explore 4-8; analysis export 4-24."),
+    ("resolution", "resolution", "Cells along the longer side, clamped to 4-24 in every output mode."),
     ("sizePower", "sizePower", "Hotspot radius exponent; 2 emphasizes high values."),
     ("colors", "colors", "Optional ordered System.Drawing colour stops, low to high."),
     ("northVector", "northVector", "Geographic north in the Rhino domain plane; defaults to World +Y."),
     ("placementPoint", "placementPoint", "Optional Rhino point for the displayed tile centre; geospatial sampling is unchanged."),
-    ("exportFieldData", "exportFieldData", "False: fast visual exploration. True: full-resolution canonical FieldDataJson for PLS/ML."),
+    ("exportFieldData", "exportFieldData", "Controls only FieldDataJson serialization. It never changes sampling, values, resolution, or geometry."),
 )
 
 OUTPUT_METADATA = (
@@ -481,7 +478,7 @@ def grid_samples(curve, plane, tolerance, resolution, metres_per_unit,
         width*metres_per_unit, height*metres_per_unit, anchor)
 
 
-def wmts_position(latitude, longitude, level=ANALYSIS_TILE_LEVEL):
+def wmts_position(latitude, longitude, level=FIELD_TILE_LEVEL):
     matrix_width = 2**(level+1)
     matrix_height = 2**level
     x = (longitude+180.0)/360.0*matrix_width
@@ -493,7 +490,7 @@ def wmts_position(latitude, longitude, level=ANALYSIS_TILE_LEVEL):
     return row, column, pixel_x, pixel_y
 
 
-def feature_url(layer, latitude, longitude, timestamp, depth=None, level=ANALYSIS_TILE_LEVEL):
+def feature_url(layer, latitude, longitude, timestamp, depth=None, level=FIELD_TILE_LEVEL):
     row, column, pixel_x, pixel_y = wmts_position(
         latitude, longitude, level=level)
     query = {
@@ -779,13 +776,8 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                         selected_variable, ", ".join(sorted(VARIABLES))))
             specification = VARIABLES[selected_variable]
             export_enabled = bool(exportFieldData)
-            query_level = (
-                ANALYSIS_TILE_LEVEL if export_enabled else
-                EXPLORE_SURFACE_TILE_LEVEL if specification["surface"] else
-                EXPLORE_REGIONAL_TILE_LEVEL)
-            probe_budget = (
-                ANALYSIS_AVAILABILITY_PROBES if export_enabled else
-                EXPLORE_AVAILABILITY_PROBES)
+            query_level = FIELD_TILE_LEVEL
+            probe_budget = AVAILABILITY_PROBES
             index, time_selection_mode = resolve_frame(timeIndex, frames)
             requested_timestamp = str(frames[index].get("time_utc") or "")
             if not requested_timestamp:
@@ -801,9 +793,8 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                     "siteData regional catalogue has no '%s' layer."
                     % specification["layer"])
             sample_depth = abs(finite_number(depth) or 0.0)
-            count = (12 if export_enabled else 8) if resolution is None else int(resolution)
-            count_limit = 24 if export_enabled else 8
-            count = max(4, min(count_limit, count))
+            count = 12 if resolution is None else int(resolution)
+            count = max(4, min(24, count))
             power = finite_number(sizePower)
             power = 2.0 if power is None else min(4.0, max(0.25, power))
             if domain is None or not isinstance(domain, Rhino.Geometry.Curve):
@@ -1009,9 +1000,10 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             "MUSSELFLOW SITE FIELD | build %s | %s | %d/%d valid | %.3fs"
             % (COMPONENT_BUILD, selected_variable, len(valid_samples),
                len(samples), time.perf_counter()-started),
-            "MODE | %s | FieldDataJson %s"
-            % ("ANALYSIS EXPORT" if export_enabled else "FAST EXPLORE",
-               "enabled" if export_enabled else "disabled"),
+            "MODE | %s"
+            % ("VISUAL + FIELD JSON" if export_enabled else "VISUAL ONLY"),
+            "DATA CONTRACT | SiteDataJson input active | FieldDataJson output %s"
+            % ("enabled" if export_enabled else "disabled"),
             "TIMING | availability %.3fs | field %.3fs | geometry %.3fs | json %.3fs"
             % (availability_seconds, field_seconds, geometry_seconds, json_seconds),
             "REQUEST PLAN | WMTS level %d | %d unique field request(s) | %d probe point(s)"
@@ -1049,6 +1041,10 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             report.append(
                 "RESOLUTION WARNING | the Rhino domain is smaller than this "
                 "product's spatial support; all samples resolve to one source cell.")
+        if abs(high-low) <= 1e-15:
+            report.append(
+                "DISPLAY NOTE | all valid samples contain one physical source value; "
+                "Normalized is 0.5 by definition, not a missing-data placeholder.")
         if max(width_m, height_m) > 100000.0:
             report.append(
                 "GEOREFERENCE WARNING | domain exceeds 100 km; the local tangent "
@@ -1056,10 +1052,6 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         if errors:
             report.append(
                 "HTTP WARNING | failed samples remain holes; no values were invented.")
-        if not export_enabled:
-            report.append(
-                "EXPLORE LIMIT | coarser WMTS query level for navigation only; "
-                "enable exportFieldData before PLS/ML or scientific extraction.")
         report.extend([
             "DATA LIMIT | processed model/ocean-colour product, not raw multispectral bands.",
             "VALIDATION LIMIT | regional fields require product-QC and local observations.",
