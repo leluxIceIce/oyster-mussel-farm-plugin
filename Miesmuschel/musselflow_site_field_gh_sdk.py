@@ -1,4 +1,3 @@
-# r: copernicusmarine==2.2.4
 """
 MusselFlow Copernicus Field — Georeferenced Environmental Preview
 =================================================================
@@ -8,14 +7,19 @@ exploration. It preserves the WGS84 anchor and physical source values, then draw
 coloured cells and value-scaled circles directly in the document.
 
 The component converts the complete Rhino boundary into one WGS84 bounding box,
-downloads the native numerical Copernicus grid once, caches that patch, and maps
-any Rhino preview resolution onto it locally. ``exportFieldData`` controls only
-whether the canonical FieldDataJson document is serialized for the PLS/ML
-pipeline; it never changes sampling, source values, or preview geometry. The old
+downloads the native numerical Copernicus grid once when the optional Copernicus
+Toolbox is already available, caches that patch, and maps any Rhino preview
+resolution onto it locally. It deliberately does not install the Toolbox into
+Rhino's shared Python environment: its large dependency tree can invalidate every
+Python component if package installation fails. Without the Toolbox, the existing
 WMTS point sampler remains a reported compatibility fallback.
 
+``exportFieldData`` controls only whether the canonical FieldDataJson document is
+serialized for the PLS/ML pipeline; it never changes sampling, source values, or
+preview geometry.
+
 Name: MusselFlow Copernicus Field
-Updated: 260816
+Updated: 260817
 Author: Felix Berger
 Copyright: Apache License 2.0
 
@@ -94,6 +98,13 @@ Create a Rhino 8 Python 3 component, convert the default component with
 complete file. The RunScript annotations create and type-hint the twelve inputs.
 Add nine output sockets once in the exact order above. BeforeRunScript applies
 all names and human-readable hover tooltips.
+
+Optional native-patch backend
+-----------------------------
+The component never auto-installs ``copernicusmarine``. A compiled plugin may
+bundle it as an internal dependency. During raw-script development it may be
+installed into a dedicated Rhino Python environment, never the shared default
+environment. If it is unavailable, Report clearly identifies the WMTS fallback.
 """
 
 import concurrent.futures
@@ -115,7 +126,7 @@ except Exception:
     copernicusmarine = None
 
 
-COMPONENT_BUILD = "2026-08-16b"
+COMPONENT_BUILD = "2026-08-17a"
 WMTS_ENDPOINT = "https://wmts.marine.copernicus.eu/teroWmts/"
 FIELD_TILE_LEVEL = 10
 HTTP_TIMEOUT_S = 25
@@ -213,9 +224,9 @@ COMPONENT_METADATA = {
     "name": "MusselFlow Copernicus Field",
     "nickname": "SiteField",
     "description": (
-        "Download one native Copernicus numerical patch for a georeferenced "
-        "Rhino domain, then resample it locally into coloured geometry and "
-        "ML-ready physical values."),
+        "Sample a Copernicus field over the WGS84 extent derived from the "
+        "input Rhino domain, then map physical values into coloured geometry "
+        "and optional PLS-ready records."),
 }
 
 INPUT_METADATA = (
@@ -255,7 +266,7 @@ def apply_component_metadata(component):
     component.Name = COMPONENT_METADATA["name"]
     component.NickName = COMPONENT_METADATA["nickname"]
     component.Description = COMPONENT_METADATA["description"]
-    component.Message = "Native patch"
+    component.Message = "Patch / WMTS"
     for index, (name, nickname, description) in enumerate(INPUT_METADATA):
         if index >= component.Params.Input.Count:
             break
@@ -478,6 +489,27 @@ def grid_samples(curve, plane, tolerance, resolution, metres_per_unit,
         "minimum_longitude": min(item[1] for item in boundary_geo),
         "maximum_longitude": max(item[1] for item in boundary_geo),
     }
+    boundary_signature = hashlib.sha256(";".join(
+        "%.9f,%.9f,%.9f" % (point.X, point.Y, point.Z)
+        for point in boundary).encode("utf-8")).hexdigest()[:16]
+    domain_request = {
+        "source": "input_closed_rhino_curve",
+        "boundary_sample_count": len(boundary),
+        "boundary_signature": boundary_signature,
+        "rhino_plane_bounds": {
+            "minimum_u": u_min,
+            "maximum_u": u_max,
+            "minimum_v": v_min,
+            "maximum_v": v_max,
+        },
+        "metres_per_model_unit": metres_per_unit,
+        "geographic_anchor_mode": "SiteData_coordinate_at_domain_bbox_centre",
+        "geographic_anchor": {
+            "latitude": anchor_latitude,
+            "longitude": anchor_longitude,
+        },
+        "wgs84_bbox": dict(field_bbox),
+    }
     samples = []
     for row in range(ny):
         v = v_min+(row+0.5)*dv
@@ -501,7 +533,8 @@ def grid_samples(curve, plane, tolerance, resolution, metres_per_unit,
             })
     return (
         samples, nx, ny, du, dv,
-        width*metres_per_unit, height*metres_per_unit, anchor, field_bbox)
+        width*metres_per_unit, height*metres_per_unit, anchor, field_bbox,
+        domain_request)
 
 
 def layer_contract(layer, kind):
@@ -659,7 +692,8 @@ def fetch_native_patch(layer, kind, field_bbox, requested_timestamp,
         raise RuntimeError("native numerical patch is not cached; press fetch once.")
     if copernicusmarine is None:
         raise RuntimeError(
-            "copernicusmarine 2.2.4 is unavailable in Rhino Python.")
+            "optional Copernicus Toolbox backend is unavailable; "
+            "using the WMTS compatibility sampler.")
 
     arguments = {
         "dataset_id": dataset_id,
@@ -1038,7 +1072,8 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             plane = curve_plane(domain, tolerance)
             if plane is None:
                 raise ValueError("domain curve must be planar.")
-            samples, nx, ny, du, dv, width_m, height_m, domain_anchor, field_bbox = grid_samples(
+            (samples, nx, ny, du, dv, width_m, height_m, domain_anchor,
+             field_bbox, domain_request) = grid_samples(
                 domain, plane, tolerance, count, metres_per_unit,
                 anchor_lat, anchor_lon, northVector)
             try:
@@ -1200,6 +1235,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                     "wgs84_bbox": field_bbox,
                     "request_count": field_url_count,
                 },
+                "domain_request": domain_request,
                 "display": {
                     "minimum": low,
                     "maximum": high,
@@ -1268,6 +1304,11 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             "WGS84 BBOX | %.8f, %.8f to %.8f, %.8f"
             % (field_bbox["minimum_longitude"], field_bbox["minimum_latitude"],
                field_bbox["maximum_longitude"], field_bbox["maximum_latitude"]),
+            "DOMAIN BOUNDARY | input closed curve | %d sampled boundary points | signature %s"
+            % (domain_request["boundary_sample_count"],
+               domain_request["boundary_signature"]),
+            "GEOREFERENCE | SiteData %.8f, %.8f is fixed at the input domain bounding-box centre"
+            % (anchor_lat, anchor_lon),
             "REGION | %s" % (region.get("name") or "from SiteData catalogue"),
             "DOMAIN | %.3f x %.3f m | grid %d x %d | %d inside"
             % (width_m, height_m, nx, ny, len(samples)),
