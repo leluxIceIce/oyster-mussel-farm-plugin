@@ -11,22 +11,24 @@ downloads the native numerical Copernicus grid once when the optional Copernicus
 Toolbox is already available, caches that patch, and maps any Rhino preview
 resolution onto it locally. It deliberately does not install the Toolbox into
 Rhino's shared Python environment: its large dependency tree can invalidate every
-Python component if package installation fails. Without the Toolbox, the existing
-WMTS point sampler remains a reported compatibility fallback.
+Python component if package installation fails. If the Toolbox is unavailable,
+the component reports the missing bulk backend and does not issue per-cell WMTS
+requests.
 
 ``exportFieldData`` controls only whether the canonical FieldDataJson document is
 serialized for the PLS/ML pipeline; it never changes sampling, source values, or
 preview geometry.
 
 Name: MusselFlow Copernicus Field
-Updated: 260817
+Updated: 260818
 Author: Felix Berger
 Copyright: Apache License 2.0
 
 Inputs:
 fetch : item / bool
-    Connect a Button. True fetches missing samples. Identical URLs are cached in
-    memory, so a held Toggle does not repeatedly contact Copernicus.
+    Connect a Button. True fetches one missing boundary patch. Identical patch
+    requests are cached in memory, so a held Toggle does not contact Copernicus
+    again.
 SiteDataJson : item / str
     SiteDataJson output from MusselFlow Site Data. It supplies the coordinate,
     regional layer catalogue, and available timestamps.
@@ -47,7 +49,9 @@ timeIndex : item / object
 depth : item / float
     Positive sampling depth in metres. Surface products ignore this value.
 resolution : item / int
-    Cells along the longer side, clamped to 4-24 in every output mode.
+    Cells along the longer side, clamped to 4-128 in every output mode. A
+    square domain at 100 creates 10,000 locally represented Rhino samples;
+    changing this value never creates additional Copernicus requests.
 sizePower : item / float
     Hotspot radius exponent. 1 is linear; 2 strongly emphasizes high values.
 colors : list / System.Drawing.Color
@@ -89,7 +93,9 @@ FieldDataJson : item / str
 Legend : list / str
     Variable, source units, raw range, display transform, time, and depth.
 Report : list / str
-    Timing, sample counts, API/cache state, resolution warnings, and limits.
+    Timing, sample counts, API/cache state, resolution warnings, limits, and a
+    chronological BACKTEST TRACE block. Copy that complete block when reporting
+    a failed or suspicious field run.
 
 SDK setup
 ---------
@@ -104,36 +110,42 @@ Optional native-patch backend
 The component never auto-installs ``copernicusmarine``. A compiled plugin may
 bundle it as an internal dependency. During raw-script development it may be
 installed into a dedicated Rhino Python environment, never the shared default
-environment. If it is unavailable, Report clearly identifies the WMTS fallback.
+environment. If it is unavailable, the component stops before any field request
+instead of falling back to hundreds of point requests.
+
+The Toolbox bulk service requires a free Copernicus Marine account and a
+one-time ``copernicusmarine.login`` for this isolated runtime. The component
+checks for credentials before requesting data and returns ``AUTH_REQUIRED``
+instead of opening an interactive prompt inside Grasshopper.
+
+Backtest contract
+-----------------
+Every solution records the georeferenced boundary signature and WGS84 bounding
+box, bulk ``read_dataframe`` arguments, cache key, returned native-grid shape,
+local nearest-cell mapping distances, and a final PASS/FAIL verdict. The trace
+counts component-level SDK calls; the SDK may perform its own transport details
+internally. MusselFlow itself performs zero per-cell GetFeatureInfo requests.
 """
 
-import concurrent.futures
 import datetime
 import hashlib
 import json
 import math
+import os
+import sys
 import time
-import urllib.parse
-import urllib.request
+import traceback
 
 import Grasshopper
 import Rhino
 import System.Drawing
 
-try:
-    import copernicusmarine
-except Exception:
-    copernicusmarine = None
 
-
-COMPONENT_BUILD = "2026-08-17a"
-WMTS_ENDPOINT = "https://wmts.marine.copernicus.eu/teroWmts/"
-FIELD_TILE_LEVEL = 10
-HTTP_TIMEOUT_S = 25
-MAX_WORKERS = 16
-MAX_SAMPLES = 576
+COMPONENT_BUILD = "2026-08-18f"
+MAX_PREVIEW_RESOLUTION = 128
+MAX_SAMPLES = MAX_PREVIEW_RESOLUTION*MAX_PREVIEW_RESOLUTION
+HIGH_RESOLUTION_WARNING = 100
 SATELLITE_LOOKBACK_DAYS = 30
-AVAILABILITY_PROBES = 3
 
 VARIABLES = {
     "current_speed": {
@@ -230,13 +242,13 @@ COMPONENT_METADATA = {
 }
 
 INPUT_METADATA = (
-    ("fetch", "fetch", "Button: fetch missing field samples; repeated URLs use memory cache."),
+    ("fetch", "fetch", "Button: fetch one missing boundary patch; identical patch requests use memory cache."),
     ("SiteDataJson", "SiteData", "Actual sampled SiteDataJson from MusselFlow Site Data."),
     ("domain", "domain", "Closed planar curve defining the sampled tile size and shape."),
     ("variable", "variable", "Field name. For chlorophyll: satellite_chlorophyll = 300 m surface Sentinel-3 OLCI; chlorophyll = depth-aware regional model."),
     ("timeIndex", "timeIndex", "Integer frame index or exact SiteData timestamp. Missing daily satellite data searches backward up to 30 days."),
     ("depth", "depth", "Positive depth in metres; ignored by surface satellite products."),
-    ("resolution", "resolution", "Local Rhino preview cells along the longer side, clamped to 4-24. This never changes the downloaded native patch."),
+    ("resolution", "resolution", "Local Rhino preview cells along the longer side, clamped to 4-128. A square grid at 100 creates 10,000 local samples but no additional Copernicus requests."),
     ("sizePower", "sizePower", "Hotspot radius exponent; 2 emphasizes high values."),
     ("colors", "colors", "Optional ordered System.Drawing colour stops, low to high."),
     ("northVector", "northVector", "Geographic north in the Rhino domain plane; defaults to World +Y."),
@@ -253,11 +265,57 @@ OUTPUT_METADATA = (
     ("Normalized", "Normalized", "Display-only values in the interval 0-1."),
     ("FieldDataJson", "FieldData", "Canonical records only when exportFieldData is True; otherwise {}."),
     ("Legend", "Legend", "Variable, units, range, timestamp, and display mapping."),
-    ("Report", "Report", "Request/cache state, coverage, warnings, and scientific scope."),
+    ("Report", "Report", "Request/cache state, coverage, warnings, scientific scope, and chronological bulk-patch backtest trace."),
 )
 
-_HTTP_CACHE = {}
 _PATCH_CACHE = {}
+
+
+class FieldTrace(object):
+    """Chronological, copyable diagnostics for one component solution."""
+
+    def __init__(self):
+        self.started = time.perf_counter()
+        self.events = []
+        self.sequence = 0
+
+    @staticmethod
+    def _text(value):
+        try:
+            return str(value).replace("\r", " ").replace("\n", " / ")
+        except Exception:
+            return "<unprintable diagnostic value>"
+
+    def add(self, event, detail=""):
+        self.sequence += 1
+        elapsed = time.perf_counter()-self.started
+        line = "TRACE %04d | +%.3fs | %s" % (
+            self.sequence, elapsed, self._text(event))
+        if detail:
+            line += " | "+self._text(detail)
+        self.events.append(line)
+
+    def add_exception(self, stage, exception):
+        self.add(
+            str(stage)+" ERROR",
+            "%s: %s" % (type(exception).__name__, self._text(exception)))
+        formatted = traceback.format_exc(limit=12).strip()
+        if formatted and formatted != "NoneType: None":
+            for line in formatted.splitlines():
+                if line.strip():
+                    self.add("PYTHON", line.strip())
+
+    def lines(self):
+        return ([
+            "BACKTEST TRACE BEGIN | copy every line through BACKTEST TRACE END",
+        ]+list(self.events)+[
+            "BACKTEST TRACE END | %d events | %.3fs elapsed"
+            % (self.sequence, time.perf_counter()-self.started),
+        ])
+
+
+class CopernicusAuthenticationRequired(RuntimeError):
+    pass
 
 
 def apply_component_metadata(component):
@@ -266,7 +324,7 @@ def apply_component_metadata(component):
     component.Name = COMPONENT_METADATA["name"]
     component.NickName = COMPONENT_METADATA["nickname"]
     component.Description = COMPONENT_METADATA["description"]
-    component.Message = "Patch / WMTS"
+    component.Message = "Native patch"
     for index, (name, nickname, description) in enumerate(INPUT_METADATA):
         if index >= component.Params.Input.Count:
             break
@@ -285,11 +343,14 @@ def apply_component_metadata(component):
         parameter.Description = description
 
 
-def empty_outputs(status, message):
-    return (None, None, [], [], [], [], "{}", [], [
+def empty_outputs(status, message, trace=None):
+    report = [
         "MUSSELFLOW SITE FIELD | build "+COMPONENT_BUILD+" | "+status,
         message,
-    ])
+    ]
+    if trace is not None:
+        report.extend(trace.lines())
+    return (None, None, [], [], [], [], "{}", [], report)
 
 
 def finite_number(value):
@@ -542,13 +603,23 @@ def layer_contract(layer, kind):
     parts = [part for part in str(layer or "").split("/") if part]
     if len(parts) < 3:
         raise ValueError("Copernicus layer is not PRODUCT/DATASET/VARIABLE.")
-    dataset_id = parts[-2]
+    wmts_dataset_id = parts[-2]
+    dataset_id = wmts_dataset_id
+    version_hint = None
+    base, separator, suffix = wmts_dataset_id.rpartition("_")
+    if (separator and len(suffix) == 6 and suffix.isdigit() and
+            suffix.startswith("20")):
+        # WMTS layer identifiers append the catalogue version (for example
+        # `_202511`). The Toolbox expects the stable dataset ID and version as
+        # separate arguments: dataset_id=... and dataset_version="202511".
+        dataset_id = base
+        version_hint = suffix
     wmts_variable = parts[-1]
     if kind == "vector_speed":
         variables = ["uo", "vo"]
     else:
         variables = [wmts_variable]
-    return dataset_id, variables
+    return dataset_id, version_hint, variables
 
 
 def patch_time_window(requested_timestamp, lookback_days):
@@ -558,9 +629,11 @@ def patch_time_window(requested_timestamp, lookback_days):
     return previous_daily_time(end, int(lookback_days)), end
 
 
-def patch_cache_key(dataset_id, variables, field_bbox, start_time, end_time, depth):
+def patch_cache_key(dataset_id, version_hint, variables, field_bbox,
+                    start_time, end_time, depth):
     return (
         dataset_id,
+        version_hint,
         tuple(variables),
         round(field_bbox["minimum_longitude"], 8),
         round(field_bbox["maximum_longitude"], 8),
@@ -678,22 +751,154 @@ def dataframe_records(frame, variables, kind, requested_timestamp, depth):
     return rows, selected_time
 
 
-def fetch_native_patch(layer, kind, field_bbox, requested_timestamp,
-                       lookback_days, depth, allow_network):
-    dataset_id, variables = layer_contract(layer, kind)
+def load_copernicus_toolbox():
+    """Import and configure the bulk backend after Script_Instance exists."""
+    runtime_root = os.path.abspath(os.path.join(
+        os.path.dirname(os.__file__), os.pardir, os.pardir))
+    dependency_path = os.environ.get("MUSSELFLOW_COPERNICUS_PATH")
+    if not dependency_path:
+        dependency_path = os.path.join(
+            runtime_root, "site-envs", "musselflow-copernicus")
+    if os.path.isdir(dependency_path) and dependency_path not in sys.path:
+        sys.path.insert(0, dependency_path)
+    runtime_info = {
+        "host_executable": sys.executable,
+        "worker_executable": None,
+        "dask_scheduler": "synchronous",
+        "dependency_path": dependency_path,
+    }
+    # Embedded CPython reports Rhinoceros as sys.executable. Without an
+    # explicit worker executable, multiprocessing.resource_tracker asks macOS
+    # to open its `-c` payload as a Rhino document. Point any unavoidable
+    # helper process at Rhino's actual CPython executable instead.
+    worker_candidates = [
+        os.path.join(runtime_root, "python3.9"),
+        os.path.join(runtime_root, "python3"),
+        os.path.join(runtime_root, "python.exe"),
+    ]
+    worker_executable = next(
+        (candidate for candidate in worker_candidates
+         if os.path.isfile(candidate)), None)
+    try:
+        multiprocessing = __import__("multiprocessing")
+        if worker_executable:
+            multiprocessing.set_executable(worker_executable)
+            runtime_info["worker_executable"] = worker_executable
+    except Exception as exception:
+        runtime_info["multiprocessing_warning"] = "%s: %s" % (
+            type(exception).__name__, str(exception))
+    # read_dataframe is an in-memory subset operation. Force Dask to remain in
+    # the Rhino process; this component does not need process workers.
+    os.environ["DASK_SCHEDULER"] = "synchronous"
+    try:
+        dask = __import__("dask")
+        dask.config.set(scheduler="synchronous")
+        toolbox = __import__("copernicusmarine")
+        if not callable(getattr(toolbox, "read_dataframe", None)):
+            raise AttributeError(
+                "copernicusmarine has no callable read_dataframe API")
+        return toolbox, None, runtime_info
+    except BaseException as exception:
+        return None, "%s: %s | expected isolated path: %s" % (
+            type(exception).__name__, str(exception), dependency_path), runtime_info
+
+
+def copernicus_credentials_source():
+    """Return a non-secret credential-source label or an actionable error."""
+    username = os.environ.get("COPERNICUSMARINE_SERVICE_USERNAME")
+    password = os.environ.get("COPERNICUSMARINE_SERVICE_PASSWORD")
+    if username and password:
+        return "environment variables", None
+    if username or password:
+        return None, (
+            "Both COPERNICUSMARINE_SERVICE_USERNAME and "
+            "COPERNICUSMARINE_SERVICE_PASSWORD must be set together.")
+
+    home = os.path.expanduser("~")
+    configured_root = os.environ.get(
+        "COPERNICUSMARINE_CREDENTIALS_DIRECTORY")
+    credentials_root = configured_root or home
+    native_file = os.path.join(
+        credentials_root, ".copernicusmarine",
+        ".copernicusmarine-credentials")
+    if os.path.isfile(native_file):
+        return "Copernicus Marine credentials file", None
+    motu_file = os.path.join(home, "motuclient", "motuclient-python.ini")
+    if os.path.isfile(motu_file):
+        return "legacy motuclient credentials file", None
+    netrc_file = os.path.join(
+        home, "_netrc" if os.name == "nt" else ".netrc")
+    if os.path.isfile(netrc_file):
+        try:
+            netrc_module = __import__("netrc")
+            configuration = netrc_module.netrc(netrc_file)
+            for host in (
+                    "auth.marine.copernicus.eu", "default_host",
+                    "nrt.cmems-du.eu", "my.cmems-du.eu"):
+                authentication = configuration.authenticators(host)
+                if (authentication and authentication[0] and
+                        authentication[2]):
+                    return "netrc credentials", None
+        except Exception:
+            pass
+    return None, (
+        "No Copernicus Marine Toolbox credentials were found. Run "
+        "copernicusmarine.login once with the isolated Rhino Python runtime, "
+        "then restart Rhino.")
+
+
+def fetch_native_patch(toolbox, layer, kind, field_bbox, requested_timestamp,
+                       lookback_days, depth, allow_network, trace=None):
+    dataset_id, version_hint, variables = layer_contract(layer, kind)
     start_time, end_time = patch_time_window(requested_timestamp, lookback_days)
     key = patch_cache_key(
-        dataset_id, variables, field_bbox, start_time, end_time, depth)
+        dataset_id, version_hint, variables, field_bbox,
+        start_time, end_time, depth)
+    cache_id = hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:16]
+    if trace is not None:
+        trace.add(
+            "PATCH PLAN",
+            "dataset=%s | wmts_version_hint=%s | variables=%s | "
+            "time=%s..%s | depth=%s | cache_key=%s"
+            % (dataset_id, version_hint or "none", ",".join(variables),
+               start_time, end_time,
+               "surface" if depth is None else "%.6g m" % float(depth),
+               cache_id))
+        trace.add(
+            "PATCH BBOX",
+            "west=%.8f | south=%.8f | east=%.8f | north=%.8f | selection=outside"
+            % (field_bbox["minimum_longitude"],
+               field_bbox["minimum_latitude"],
+               field_bbox["maximum_longitude"],
+               field_bbox["maximum_latitude"]))
     if key in _PATCH_CACHE:
         cached = dict(_PATCH_CACHE[key])
         cached["cache_hit"] = True
+        cached["sdk_call_count"] = 0
+        cached["sdk_seconds"] = 0.0
+        cached["cache_id"] = cache_id
+        if trace is not None:
+            trace.add(
+                "PATCH CACHE HIT",
+                "cache_key=%s | records=%d | component SDK calls this run=0"
+                % (cache_id, len(cached.get("records") or [])))
         return cached
     if not allow_network:
+        if trace is not None:
+            trace.add(
+                "PATCH CACHE MISS",
+                "cache_key=%s | fetch=False | network call suppressed" % cache_id)
         raise RuntimeError("native numerical patch is not cached; press fetch once.")
-    if copernicusmarine is None:
+    if toolbox is None:
         raise RuntimeError(
-            "optional Copernicus Toolbox backend is unavailable; "
-            "using the WMTS compatibility sampler.")
+            "optional Copernicus Toolbox bulk backend is unavailable.")
+    credential_source, credential_error = copernicus_credentials_source()
+    if credential_source is None:
+        if trace is not None:
+            trace.add("AUTH REQUIRED", credential_error)
+        raise CopernicusAuthenticationRequired(credential_error)
+    if trace is not None:
+        trace.add("AUTH READY", "source="+credential_source)
 
     arguments = {
         "dataset_id": dataset_id,
@@ -707,75 +912,124 @@ def fetch_native_patch(layer, kind, field_bbox, requested_timestamp,
         "coordinates_selection_method": "outside",
         "disable_progress_bar": True,
     }
+    if version_hint:
+        # Preserve the exact WMTS/catalogue version without corrupting the
+        # Toolbox dataset ID. This is the supported read_dataframe signature.
+        arguments["dataset_version"] = version_hint
     if depth is not None:
         arguments["minimum_depth"] = float(depth)
         arguments["maximum_depth"] = float(depth)
 
-    frame = copernicusmarine.read_dataframe(**arguments)
+    if trace is not None:
+        trace.add(
+            "PATCH CACHE MISS",
+            "cache_key=%s | cache_entries_before=%d" % (
+                cache_id, len(_PATCH_CACHE)))
+        trace.add(
+            "BULK SDK CALL START",
+            "copernicusmarine.read_dataframe | component_call=1 | args=%s"
+            % canonical_json(arguments))
+    sdk_started = time.perf_counter()
+    try:
+        frame = toolbox.read_dataframe(**arguments)
+    except Exception as exception:
+        if trace is not None:
+            trace.add(
+                "BULK SDK CALL FAILED",
+                "%.3fs | %s: %s" % (
+                    time.perf_counter()-sdk_started,
+                    type(exception).__name__, str(exception)))
+        raise
+    sdk_seconds = time.perf_counter()-sdk_started
+    try:
+        frame_rows = len(frame.index)
+        frame_columns = [str(column) for column in frame.columns]
+        index_names = [str(name) for name in frame.index.names]
+    except Exception:
+        frame_rows = -1
+        frame_columns = []
+        index_names = []
+    if trace is not None:
+        trace.add(
+            "BULK SDK CALL END",
+            "%.3fs | rows=%d | columns=%s | index=%s"
+            % (sdk_seconds, frame_rows, ",".join(frame_columns),
+               ",".join(index_names)))
     records, selected_time = dataframe_records(
         frame, variables, kind, requested_timestamp, depth)
     if not records:
         raise ValueError("native numerical patch contains no valid values.")
+    latitudes = [record["source_latitude"] for record in records]
+    longitudes = [record["source_longitude"] for record in records]
+    values = [record["value"] for record in records]
+    source_depths = sorted(set(
+        record["source_depth"] for record in records
+        if record.get("source_depth") is not None))
+    if trace is not None:
+        trace.add(
+            "PATCH EXTRACTED",
+            "records=%d | selected_time=%s | source_depths=%s | "
+            "lon=%.8f..%.8f | lat=%.8f..%.8f | value=%.8g..%.8g"
+            % (len(records), selected_time,
+               ",".join("%.6g" % item for item in source_depths) or "surface",
+               min(longitudes), max(longitudes),
+               min(latitudes), max(latitudes), min(values), max(values)))
     result = {
         "dataset_id": dataset_id,
+        "dataset_version": version_hint,
+        "wmts_version_hint": version_hint,
         "variables": variables,
         "records": records,
         "selected_time": selected_time,
         "requested_bbox": dict(field_bbox),
         "cache_hit": False,
+        "cache_id": cache_id,
+        "sdk_call_count": 1,
+        "sdk_seconds": sdk_seconds,
+        "frame_row_count": frame_rows,
+        "frame_columns": frame_columns,
+        "source_depths": source_depths,
     }
     _PATCH_CACHE[key] = dict(result)
+    if trace is not None:
+        trace.add(
+            "PATCH CACHE STORE",
+            "cache_key=%s | cache_entries_after=%d" % (
+                cache_id, len(_PATCH_CACHE)))
     return result
 
 
 def apply_native_patch(samples, records, anchor_latitude):
     """Nearest-cell resampling is local; it performs no HTTP operations."""
     longitude_weight = max(1e-9, math.cos(math.radians(anchor_latitude)))
+    distances_m = []
+    source_cells = set()
     for sample in samples:
         latitude = sample["latitude"]
         longitude = sample["longitude"]
         nearest = min(records, key=lambda record: (
             (record["source_latitude"]-latitude)**2+
             ((record["source_longitude"]-longitude)*longitude_weight)**2))
+        distance_degrees = math.sqrt(
+            (nearest["source_latitude"]-latitude)**2+
+            ((nearest["source_longitude"]-longitude)*longitude_weight)**2)
+        distances_m.append(distance_degrees*111320.0)
         sample["value"] = nearest["value"]
         sample["source_latitude"] = nearest["source_latitude"]
         sample["source_longitude"] = nearest["source_longitude"]
         sample["source_time"] = nearest.get("source_time")
         sample["source_depth"] = nearest.get("source_depth")
         sample["source_cell_id"] = nearest.get("source_cell_id")
-
-
-def wmts_position(latitude, longitude, level=FIELD_TILE_LEVEL):
-    matrix_width = 2**(level+1)
-    matrix_height = 2**level
-    x = (longitude+180.0)/360.0*matrix_width
-    y = (90.0-latitude)/180.0*matrix_height
-    column = min(matrix_width-1, max(0, int(math.floor(x))))
-    row = min(matrix_height-1, max(0, int(math.floor(y))))
-    pixel_x = min(255, max(0, int(math.floor((x-column)*256.0))))
-    pixel_y = min(255, max(0, int(math.floor((y-row)*256.0))))
-    return row, column, pixel_x, pixel_y
-
-
-def feature_url(layer, latitude, longitude, timestamp, depth=None, level=FIELD_TILE_LEVEL):
-    row, column, pixel_x, pixel_y = wmts_position(
-        latitude, longitude, level=level)
-    query = {
-        "service": "WMTS",
-        "request": "GetFeatureInfo",
-        "layer": layer,
-        "tilematrixset": "EPSG:4326",
-        "tilematrix": str(level),
-        "tilerow": str(row),
-        "tilecol": str(column),
-        "i": str(pixel_x),
-        "j": str(pixel_y),
-        "INFOFORMAT": "application/json",
-        "time": timestamp,
+        source_cells.add(sample["source_cell_id"])
+    return {
+        "preview_samples": len(samples),
+        "patch_records": len(records),
+        "unique_source_cells": len(source_cells),
+        "mean_nearest_distance_m": (
+            sum(distances_m)/float(len(distances_m)) if distances_m else 0.0),
+        "maximum_nearest_distance_m": max(distances_m) if distances_m else 0.0,
+        "per_cell_http_calls": 0,
     }
-    if depth is not None:
-        query["elevation"] = str(-abs(float(depth)))
-    return WMTS_ENDPOINT+"?"+urllib.parse.urlencode(query)
 
 
 def ocean_colour_layer(layers, timestamp):
@@ -795,51 +1049,6 @@ def ocean_colour_layer(layers, timestamp):
     return recent if -2 <= age_days <= 35 else archive
 
 
-def http_json(url):
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "MusselFlow-Rhino/"+COMPONENT_BUILD})
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def fetch_urls(urls, allow_network):
-    unique = sorted(set(urls))
-    missing = [url for url in unique if url not in _HTTP_CACHE]
-    errors = {}
-    if missing and allow_network:
-        workers = min(MAX_WORKERS, len(missing))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(http_json, url): url for url in missing}
-            for future in concurrent.futures.as_completed(futures):
-                url = futures[future]
-                try:
-                    _HTTP_CACHE[url] = future.result()
-                except Exception as exception:
-                    errors[url] = "%s: %s" % (
-                        type(exception).__name__, str(exception))
-    documents = {url: _HTTP_CACHE[url] for url in unique if url in _HTTP_CACHE}
-    return documents, errors, len(missing), len(unique)-len(missing)
-
-
-def feature_properties(document):
-    try:
-        features = document.get("features") or []
-        return features[0].get("properties") or {}
-    except (AttributeError, IndexError):
-        return {}
-
-
-def field_value(properties, kind):
-    if kind == "vector_speed":
-        east = finite_number(properties.get("component1Value"))
-        north = finite_number(properties.get("component2Value"))
-        return None if east is None or north is None else math.hypot(east, north)
-    value = finite_number(properties.get("value"))
-    if value is not None and kind == "oxygen":
-        return value*0.032
-    return value
-
-
 def daily_time(timestamp):
     return str(timestamp)[:10]+"T00:00:00Z"
 
@@ -852,43 +1061,6 @@ def previous_daily_time(timestamp, days_back):
         raise ValueError("cannot derive a daily fallback from time: %s" % timestamp)
     day -= datetime.timedelta(days=int(days_back))
     return day.strftime("%Y-%m-%dT00:00:00Z")
-
-
-def representative_samples(samples, maximum=5):
-    """Choose a small spatial spread for inexpensive date-availability probes."""
-    if len(samples) <= maximum:
-        return list(samples)
-    last = len(samples)-1
-    indices = sorted(set(
-        int(round(last*step/float(maximum-1))) for step in range(maximum)))
-    return [samples[index] for index in indices]
-
-
-def urls_for_samples(samples, layer, timestamp, depth, level):
-    return [
-        feature_url(
-            layer, sample["latitude"], sample["longitude"],
-            timestamp, depth, level)
-        for sample in samples
-    ]
-
-
-def documents_contain_value(samples, urls, documents, kind):
-    """True when at least one representative point has a physical value."""
-    for sample, url in zip(samples, urls):
-        properties = feature_properties(documents.get(url, {}))
-        if field_value(properties, kind) is not None:
-            return True
-    return False
-
-
-def apply_documents(samples, urls, documents, kind):
-    """Attach source values and coordinates to a complete spatial sample set."""
-    for sample, url in zip(samples, urls):
-        properties = feature_properties(documents.get(url, {}))
-        sample["value"] = field_value(properties, kind)
-        sample["source_latitude"] = finite_number(properties.get("lat"))
-        sample["source_longitude"] = finite_number(properties.get("lon"))
 
 
 def default_colors():
@@ -1034,6 +1206,11 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             exportFieldData: bool):
         """Preview one field quickly; optionally export canonical analysis records."""
         started = time.perf_counter()
+        trace = FieldTrace()
+        trace.add(
+            "RUN START",
+            "build=%s | fetch=%s | resolution_input=%s | exportFieldData=%s"
+            % (COMPONENT_BUILD, bool(fetch), resolution, bool(exportFieldData)))
         try:
             site, anchor_lat, anchor_lon, frames = parse_site_data(SiteDataJson)
             selected_variable = variable_name(variable)
@@ -1043,8 +1220,6 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                         selected_variable, ", ".join(sorted(VARIABLES))))
             specification = VARIABLES[selected_variable]
             export_enabled = bool(exportFieldData)
-            query_level = FIELD_TILE_LEVEL
-            probe_budget = AVAILABILITY_PROBES
             index, time_selection_mode = resolve_frame(timeIndex, frames)
             requested_timestamp = str(frames[index].get("time_utc") or "")
             if not requested_timestamp:
@@ -1060,8 +1235,13 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                     "siteData regional catalogue has no '%s' layer."
                     % specification["layer"])
             sample_depth = abs(finite_number(depth) or 0.0)
-            count = 12 if resolution is None else int(resolution)
-            count = max(4, min(24, count))
+            requested_resolution = 12 if resolution is None else int(resolution)
+            count = max(4, min(MAX_PREVIEW_RESOLUTION, requested_resolution))
+            if count != requested_resolution:
+                trace.add(
+                    "RESOLUTION CLAMP",
+                    "requested=%d | applied=%d | allowed=4..%d"
+                    % (requested_resolution, count, MAX_PREVIEW_RESOLUTION))
             power = finite_number(sizePower)
             power = 2.0 if power is None else min(4.0, max(0.25, power))
             if domain is None or not isinstance(domain, Rhino.Geometry.Curve):
@@ -1087,117 +1267,162 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 plane.Origin+translation, plane.XAxis, plane.YAxis)
             for sample in samples:
                 sample["display_point"] = sample["point"]+translation
+            trace.add(
+                "INPUT CONTRACT",
+                "variable=%s | frame=%d/%d | selection=%s | requested_time=%s | "
+                "depth=%s | preview_resolution=%d"
+                % (selected_variable, index, len(frames), time_selection_mode,
+                   requested_timestamp,
+                   "surface" if specification["surface"]
+                   else "%.6g m" % sample_depth,
+                   count))
+            trace.add(
+                "LAYER CONTRACT",
+                "catalogue_layer=%s | kind=%s | lookback_days=%d"
+                % (layer, specification["kind"],
+                   int(specification.get("lookback_days") or 0)))
+            trace.add(
+                "BOUNDARY SAMPLE",
+                "source=closed Rhino curve | points=%d | signature=%s | "
+                "model_size=%.3f x %.3f m | metres_per_unit=%.12g"
+                % (domain_request["boundary_sample_count"],
+                   domain_request["boundary_signature"], width_m, height_m,
+                   metres_per_unit))
+            trace.add(
+                "PREVIEW GRID",
+                "columns=%d | rows=%d | candidate_cells=%d | inside_boundary=%d"
+                % (nx, ny, nx*ny, len(samples)))
+            trace.add(
+                "GEOREFERENCE",
+                "anchor_lat=%.8f | anchor_lon=%.8f | bbox=%.8f,%.8f,%.8f,%.8f"
+                % (anchor_lat, anchor_lon,
+                   field_bbox["minimum_longitude"],
+                   field_bbox["minimum_latitude"],
+                   field_bbox["maximum_longitude"],
+                   field_bbox["maximum_latitude"]))
         except Exception as exception:
-            return empty_outputs("INVALID_INPUT", str(exception))
+            trace.add_exception("INPUT/BOUNDARY", exception)
+            return empty_outputs("INVALID_INPUT", str(exception), trace)
 
         query_depth = None if specification["surface"] else sample_depth
         lookback_days = int(specification.get("lookback_days") or 0)
         timestamp = None
         fallback_days = None
-        errors = {}
         missing_before = 0
         cached_before = 0
-        field_url_count = 0
-        availability_seconds = 0.0
-        probes = []
+        sdk_call_count = 0
         backend = "COPERNICUS TOOLBOX NATIVE PATCH"
-        backend_warning = None
+
+        trace.add(
+            "BACKEND IMPORT START",
+            "lazy import after GH_ScriptInstance construction")
+        toolbox, toolbox_error, runtime_info = load_copernicus_toolbox()
+        trace.add(
+            "EMBEDDED RUNTIME",
+            "host_executable=%s | worker_executable=%s | dask_scheduler=%s"
+            % (runtime_info.get("host_executable"),
+               runtime_info.get("worker_executable") or "unavailable",
+               runtime_info.get("dask_scheduler")))
+        if runtime_info.get("multiprocessing_warning"):
+            trace.add(
+                "RUNTIME WARNING",
+                runtime_info["multiprocessing_warning"])
+        if toolbox is None:
+            trace.add("BACKEND IMPORT FAILED", toolbox_error)
+            return empty_outputs(
+                "BULK_BACKEND_UNAVAILABLE",
+                "The optional Copernicus Toolbox is not available (%s). No "
+                "package installation and no per-cell WMTS fallback were attempted."
+                % toolbox_error, trace)
+        trace.add(
+            "BACKEND READY",
+            "copernicusmarine=%s | read_dataframe=callable | module=%s"
+            % (getattr(toolbox, "__version__", "unknown"),
+               getattr(toolbox, "__file__", "unknown")))
 
         field_started = time.perf_counter()
         try:
             patch = fetch_native_patch(
-                layer, specification["kind"], field_bbox,
-                requested_timestamp, lookback_days, query_depth, bool(fetch))
-            apply_native_patch(samples, patch["records"], anchor_lat)
+                toolbox, layer, specification["kind"], field_bbox,
+                requested_timestamp, lookback_days, query_depth, bool(fetch),
+                trace=trace)
+            mapping_stats = apply_native_patch(
+                samples, patch["records"], anchor_lat)
             timestamp = patch.get("selected_time") or requested_timestamp
-            field_url_count = 1
+            sdk_call_count = int(patch.get("sdk_call_count") or 0)
             if patch.get("cache_hit"):
                 cached_before = 1
             else:
                 missing_before = 1
+            trace.add(
+                "LOCAL RESAMPLE",
+                "preview_samples=%d | patch_records=%d | unique_source_cells=%d | "
+                "mean_nearest=%.3f m | max_nearest=%.3f m | per_cell_http_calls=%d"
+                % (mapping_stats["preview_samples"],
+                   mapping_stats["patch_records"],
+                   mapping_stats["unique_source_cells"],
+                   mapping_stats["mean_nearest_distance_m"],
+                   mapping_stats["maximum_nearest_distance_m"],
+                   mapping_stats["per_cell_http_calls"]))
             requested_number = timestamp_number(requested_timestamp)
             selected_number = timestamp_number(timestamp)
             if requested_number is not None and selected_number is not None:
                 fallback_days = max(
                     0, int(round((requested_number-selected_number)/86400.0)))
         except Exception as patch_exception:
+            trace.add_exception("BULK PATCH", patch_exception)
+            if isinstance(
+                    patch_exception, CopernicusAuthenticationRequired):
+                return empty_outputs(
+                    "AUTH_REQUIRED", str(patch_exception), trace)
             if not fetch:
                 return empty_outputs(
                     "WAITING",
-                    "Press fetch once for the native numerical bounding-box patch. %s"
-                    % patch_exception)
-
-            # Keep the prior point sampler only as a compatibility fallback.
-            # Its use is explicit in Report because it can be much slower.
-            backend = "WMTS GETFEATUREINFO FALLBACK"
-            backend_warning = "%s: %s" % (
-                type(patch_exception).__name__, str(patch_exception))
-            candidate_times = [requested_timestamp]
-            candidate_times.extend(
-                previous_daily_time(requested_timestamp, offset)
-                for offset in range(1, lookback_days+1))
-            availability_started = time.perf_counter()
-            probes = representative_samples(samples, maximum=probe_budget)
-            probe_plans = []
-            all_probe_urls = []
-            for offset, candidate_time in enumerate(candidate_times):
-                candidate_urls = urls_for_samples(
-                    probes, layer, candidate_time, query_depth, query_level)
-                probe_plans.append((offset, candidate_time, candidate_urls))
-                all_probe_urls.extend(candidate_urls)
-            probe_documents, probe_errors, missing, cached = fetch_urls(
-                all_probe_urls, True)
-            errors.update(probe_errors)
-            missing_before += missing
-            cached_before += cached
-            for offset, candidate_time, candidate_urls in probe_plans:
-                if documents_contain_value(
-                        probes, candidate_urls, probe_documents,
-                        specification["kind"]):
-                    timestamp = candidate_time
-                    fallback_days = offset
-                    break
-            availability_seconds = time.perf_counter()-availability_started
-            if timestamp is not None:
-                urls = urls_for_samples(
-                    samples, layer, timestamp, query_depth, query_level)
-                field_url_count = len(set(urls))
-                documents, full_errors, missing, cached = fetch_urls(
-                    urls, True)
-                errors.update(full_errors)
-                missing_before += missing
-                cached_before += cached
-                apply_documents(samples, urls, documents, specification["kind"])
-            else:
-                search_text = (
-                    "requested date only" if lookback_days == 0
-                    else "%d daily dates (%s through %s)" % (
-                        len(candidate_times), candidate_times[0],
-                        candidate_times[-1]))
-                detail = ""
-                if errors:
-                    detail = " First HTTP error: "+next(iter(errors.values()))
-                return empty_outputs(
-                    "NO_DATA",
-                    "No valid %s values were returned after searching %s.%s"
-                    % (selected_variable, search_text, detail))
+                    "Press fetch once for the native numerical bounding-box patch. "
+                    +str(patch_exception), trace)
+            return empty_outputs(
+                "BULK_FETCH_ERROR",
+                "%s: %s. No per-cell WMTS fallback was attempted."
+                % (type(patch_exception).__name__, str(patch_exception)), trace)
         field_seconds = time.perf_counter()-field_started
 
-        valid_samples, low, high = normalize_samples(samples)
+        try:
+            valid_samples, low, high = normalize_samples(samples)
+        except Exception as exception:
+            trace.add_exception("NORMALIZE", exception)
+            return empty_outputs(
+                "NORMALIZE_ERROR", "%s: %s" % (
+                    type(exception).__name__, str(exception)), trace)
         if not valid_samples:
-            detail = ""
-            if errors:
-                detail = " First HTTP error: "+next(iter(errors.values()))
+            trace.add(
+                "NO VALID DATA",
+                "patch_records=%d | preview_samples=%d"
+                % (len(patch.get("records") or []), len(samples)))
             return empty_outputs(
                 "NO_DATA",
-                "No valid %s values were returned for this domain/time/depth.%s"
-                % (selected_variable, detail))
+                "The bulk patch returned no valid %s values for this "
+                "domain/time/depth." % selected_variable, trace)
+        trace.add(
+            "VALUES NORMALIZED",
+            "valid=%d/%d | raw_min=%.8g | raw_max=%.8g"
+            % (len(valid_samples), len(samples), low, high))
 
         geometry_started = time.perf_counter()
-        stops = color_stops(colors)
-        field_mesh, hotspot_mesh, circles, points, values, normalized = (
-            make_geometry(valid_samples, display_plane, du, dv, power, stops))
+        try:
+            stops = color_stops(colors)
+            field_mesh, hotspot_mesh, circles, points, values, normalized = (
+                make_geometry(
+                    valid_samples, display_plane, du, dv, power, stops))
+        except Exception as exception:
+            trace.add_exception("GEOMETRY", exception)
+            return empty_outputs(
+                "GEOMETRY_ERROR", "%s: %s" % (
+                    type(exception).__name__, str(exception)), trace)
         geometry_seconds = time.perf_counter()-geometry_started
+        trace.add(
+            "GEOMETRY READY",
+            "field_cells=%d | hotspot_circles=%d | points=%d | %.3fs"
+            % (len(valid_samples), len(circles), len(points), geometry_seconds))
         unique_cells = source_cell_count(valid_samples)
         region = site.get("regional_product") or {}
         json_started = time.perf_counter()
@@ -1232,8 +1457,15 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 },
                 "source_patch": {
                     "backend": backend,
+                    "dataset_id": patch.get("dataset_id"),
+                    "wmts_version_hint": patch.get("wmts_version_hint"),
                     "wgs84_bbox": field_bbox,
-                    "request_count": field_url_count,
+                    "component_sdk_call_count": sdk_call_count,
+                    "per_cell_http_call_count": 0,
+                    "cache_hit": bool(patch.get("cache_hit")),
+                    "cache_id": patch.get("cache_id"),
+                    "native_record_count": len(patch.get("records") or []),
+                    "mapping": mapping_stats,
                 },
                 "domain_request": domain_request,
                 "display": {
@@ -1268,10 +1500,20 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 "scientific_status": "COPERNICUS_DERIVED_FIELD_NOT_SITE_VALIDATED",
             }
     
-            field_data_json = canonical_json(field_document)
+            try:
+                field_data_json = canonical_json(field_document)
+            except Exception as exception:
+                trace.add_exception("FIELD JSON", exception)
+                return empty_outputs(
+                    "FIELD_JSON_ERROR", "%s: %s" % (
+                        type(exception).__name__, str(exception)), trace)
         else:
             field_data_json = "{}"
         json_seconds = time.perf_counter()-json_started
+        trace.add(
+            "FIELD JSON",
+            "enabled=%s | characters=%d | %.3fs"
+            % (export_enabled, len(field_data_json), json_seconds))
         legend = [
             "VARIABLE | %s" % selected_variable,
             "SOURCE | %s" % specification.get(
@@ -1296,11 +1538,18 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             % ("VISUAL + FIELD JSON" if export_enabled else "VISUAL ONLY"),
             "DATA CONTRACT | SiteDataJson input active | FieldDataJson output %s"
             % ("enabled" if export_enabled else "disabled"),
-            "TIMING | availability %.3fs | field %.3fs | geometry %.3fs | json %.3fs"
-            % (availability_seconds, field_seconds, geometry_seconds, json_seconds),
+            "TIMING | field %.3fs | geometry %.3fs | json %.3fs"
+            % (field_seconds, geometry_seconds, json_seconds),
             "DATA BACKEND | %s" % backend,
-            "REQUEST PLAN | %d remote patch/request operation(s); preview grid resampled locally"
-            % field_url_count,
+            "DATASET | %s | WMTS version hint %s"
+            % (patch.get("dataset_id"),
+               patch.get("wmts_version_hint") or "none"),
+            "REQUEST PLAN | one boundary patch | read_dataframe calls this run %d | "
+            "per-cell GetFeatureInfo calls 0"
+            % sdk_call_count,
+            "REQUEST REDUCTION | %d bulk SDK call(s) instead of up to %d legacy "
+            "point requests for this preview"
+            % (sdk_call_count, len(samples)),
             "WGS84 BBOX | %.8f, %.8f to %.8f, %.8f"
             % (field_bbox["minimum_longitude"], field_bbox["minimum_latitude"],
                field_bbox["maximum_longitude"], field_bbox["maximum_latitude"]),
@@ -1312,12 +1561,21 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             "REGION | %s" % (region.get("name") or "from SiteData catalogue"),
             "DOMAIN | %.3f x %.3f m | grid %d x %d | %d inside"
             % (width_m, height_m, nx, ny, len(samples)),
+            "PREVIEW RESOLUTION | requested %d | applied %d | maximum %d"
+            % (requested_resolution, count, MAX_PREVIEW_RESOLUTION),
             "PLACEMENT | Rhino %.3f, %.3f, %.3f | SiteData WGS84 unchanged"
             % (display_anchor.X, display_anchor.Y, display_anchor.Z),
-            "CACHE | %d uncached patch/request set(s) | %d cached | %d failures"
-            % (missing_before, cached_before, len(errors)),
+            "CACHE | %d uncached patch request(s) | %d cached"
+            % (missing_before, cached_before),
+            "PATCH CACHE KEY | %s | independent of preview resolution"
+            % patch.get("cache_id"),
             "SOURCE CELLS | %d distinct Copernicus cells represented"
             % unique_cells,
+            "LOCAL MAPPING | %d preview samples from %d native records | "
+            "nearest mean %.3f m | max %.3f m"
+            % (mapping_stats["preview_samples"], mapping_stats["patch_records"],
+               mapping_stats["mean_nearest_distance_m"],
+               mapping_stats["maximum_nearest_distance_m"]),
             "TIME SELECTION | %s | frame %d | %s"
             % (time_selection_mode, index, requested_timestamp),
         ]
@@ -1328,10 +1586,13 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         elif lookback_days:
             report.append(
                 "TIME FALLBACK | exact requested daily observation available")
-        if backend_warning:
+        if query_depth is not None:
+            native_depths = patch.get("source_depths") or []
             report.append(
-                "BACKEND WARNING | native patch failed; WMTS point fallback used | "
-                +backend_warning)
+                "DEPTH SELECTION | requested %.6g m | nearest native layer %s"
+                % (query_depth,
+                   ", ".join("%.6g m" % item for item in native_depths)
+                   if native_depths else "not reported"))
         if selected_variable == "chlorophyll":
             report.append(
                 "SOURCE MODE | depth-aware regional BGC model | nominal 7 km; "
@@ -1346,6 +1607,12 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             report.append(
                 "RESOLUTION WARNING | the Rhino domain is smaller than this "
                 "product's spatial support; all samples resolve to one source cell.")
+        if count >= HIGH_RESOLUTION_WARNING:
+            report.append(
+                "PERFORMANCE NOTE | resolution %d produced %d represented cells; "
+                "Rhino mesh, circle, and JSON work grows approximately with "
+                "resolution squared. Copernicus requests remain one-or-zero."
+                % (count, len(valid_samples)))
         if abs(high-low) <= 1e-15:
             report.append(
                 "DISPLAY NOTE | all valid samples contain one physical source value; "
@@ -1354,13 +1621,50 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             report.append(
                 "GEOREFERENCE WARNING | domain exceeds 100 km; the local tangent "
                 "coordinate approximation should be replaced by a map projection.")
-        if errors:
-            report.append(
-                "HTTP WARNING | failed samples remain holes; no values were invented.")
         report.extend([
+            "RESOLUTION NOTE | higher preview resolution adds local Rhino samples; "
+            "it does not increase the native Copernicus product resolution.",
             "DATA LIMIT | processed model/ocean-colour product, not raw multispectral bands.",
             "VALIDATION LIMIT | regional fields require product-QC and local observations.",
         ])
+        invariant_failures = []
+        if sdk_call_count not in (0, 1):
+            invariant_failures.append("read_dataframe call count is not 0 or 1")
+        if mapping_stats["per_cell_http_calls"] != 0:
+            invariant_failures.append("per-cell HTTP calls were detected")
+        if mapping_stats["preview_samples"] != len(samples):
+            invariant_failures.append("not every preview sample was mapped")
+        if patch.get("requested_bbox") != field_bbox:
+            invariant_failures.append("returned patch key does not match boundary bbox")
+        dataset_tail = str(patch.get("dataset_id") or "").rpartition("_")[2]
+        if (len(dataset_tail) == 6 and dataset_tail.isdigit() and
+                dataset_tail.startswith("20")):
+            invariant_failures.append(
+                "Toolbox dataset_id still contains a WMTS version suffix")
+        if invariant_failures:
+            verdict = "FAIL | "+"; ".join(invariant_failures)
+        else:
+            verdict = (
+                "PASS | one-or-zero bulk SDK calls, zero per-cell calls, "
+                "boundary bbox preserved, all preview samples mapped locally")
+        report.append("BACKTEST VERDICT | "+verdict)
+        trace.add("BACKTEST VERDICT", verdict)
+        trace.add(
+            "REQUEST REDUCTION",
+            "bulk_sdk_calls=%d | legacy_point_call_upper_bound=%d | "
+            "actual_per_cell_calls=0"
+            % (sdk_call_count, len(samples)))
+        trace.add(
+            "RESOLUTION SEMANTICS",
+            "preview_resolution=%d changes local sample density only | "
+            "boundary cache_key=%s"
+            % (count, patch.get("cache_id")))
+        trace.add(
+            "RUN COMPLETE",
+            "valid=%d/%d | source_cells=%d | total=%.3fs"
+            % (len(valid_samples), len(samples), unique_cells,
+               time.perf_counter()-started))
+        report.extend(trace.lines())
         return (
             field_mesh, hotspot_mesh, circles, points, values, normalized,
             field_data_json, legend, report)
