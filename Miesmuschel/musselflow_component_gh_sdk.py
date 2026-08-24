@@ -64,6 +64,10 @@ qualityMode : item / int
 speedMode : item / bool
     True enables the aggressively sampled Galapagos search path. It overrides
     REFINE geometry but retains the complete ecological solver and constraints.
+FieldDataJson : tree / str
+    Optional MusselFlow Site Field document(s). Raw physical values are sampled
+    at obstacle centres and condition chlorophyll, TSM, temperature, salinity,
+    and dissolved oxygen. This supplements; it never replaces SimulationCaseJson.
 
 Outputs — seven ports in this order
 -----------------------------------
@@ -91,6 +95,7 @@ numerical core and is the next Grasshopper integration step.
 """
 
 import importlib
+import json
 import math
 import os
 import sys
@@ -111,7 +116,7 @@ COMPONENT_METADATA = {
         "diagnostics; it is not CFD or regulatory evidence."),
 }
 
-COMPONENT_BUILD = "2026-08-08b"
+COMPONENT_BUILD = "2026-08-24a"
 OUTPUT_DECIMALS = 6
 OUTPUT_SIGNIFICANT_DIGITS = 6
 
@@ -129,6 +134,7 @@ INPUT_METADATA = (
     ("SimulationCaseJson", "SimulationCase", "Executable ecological model with site forcing from Site Data."),
     ("qualityMode", "qualityMode", "0 = FAST Galapagos; 1 = REFINE elite designs."),
     ("speedMode", "speedMode", "True = aggressive SPEED search; full biology remains active."),
+    ("FieldDataJson", "FieldData", "Optional Site Field JSON tree; spatial raw values supplement the simulation case."),
 )
 
 OUTPUT_METADATA = (
@@ -168,6 +174,8 @@ def apply_component_metadata(component):
             # RunScript call even when this SDK script is pasted over an older
             # component whose sockets still carry Item access.
             parameter.Access = Grasshopper.Kernel.GH_ParamAccess.list
+        elif index == 8:
+            parameter.Access = Grasshopper.Kernel.GH_ParamAccess.tree
 
     for index, (name, nickname, description) in enumerate(OUTPUT_METADATA):
         if index >= component.Params.Output.Count:
@@ -264,6 +272,216 @@ def resolve_rhino_value(value):
             document.Objects.FindId(value) if document is not None else None)
         return rhino_object.Geometry if rhino_object is not None else None
     return value
+
+
+FIELD_VARIABLE_MAP = {
+    "chlorophyll": "chlorophyll_ug_l",
+    "satellite_chlorophyll": "chlorophyll_ug_l",
+    "tsm": "tsm_mg_l",
+    "temperature": "temperature_c",
+    "salinity": "salinity_psu",
+    "oxygen": "boundary_do_mg_l",
+}
+
+FIELD_BASELINE_KEYS = {
+    "chlorophyll_ug_l": "site.chlorophyll_ug_l",
+    "tsm_mg_l": "site.tsm_mg_l",
+    "temperature_c": "site.temperature_c",
+    "salinity_psu": "site.salinity_psu",
+    "boundary_do_mg_l": "site.boundary_do_mg_l",
+}
+
+
+def field_document_records(value):
+    """Flatten one text item, list, or DataTree without splitting strings."""
+    if value is None:
+        return []
+    resolved = resolve_rhino_value(value)
+    if isinstance(resolved, str):
+        return [("{0}", 0, 0, resolved)]
+    return tree_records(value)
+
+
+def _field_point_xy(record, plane, metres_per_model_unit):
+    coordinates = record.get("rhino_point")
+    if isinstance(coordinates, dict):
+        coordinates = (
+            coordinates.get("x"),
+            coordinates.get("y"),
+            coordinates.get("z", plane.Origin.Z),
+        )
+    if not isinstance(coordinates, (list, tuple)) or len(coordinates) < 2:
+        return None
+    try:
+        z = coordinates[2] if len(coordinates) > 2 else plane.Origin.Z
+        point = Rhino.Geometry.Point3d(
+            float(coordinates[0]), float(coordinates[1]), float(z))
+        delta = point-plane.Origin
+        return np.asarray((
+            float(delta*plane.XAxis)*metres_per_model_unit,
+            float(delta*plane.YAxis)*metres_per_model_unit), dtype=float)
+    except Exception:
+        return None
+
+
+def resolve_environment_fields(
+        value, plane, metres_per_model_unit, obstacle_xy_m, config):
+    """Sample raw Site Field values at obstacle centres.
+
+    Display-normalized values and preview colours are intentionally ignored.
+    Unsupported variables remain available to downstream analysis but do not
+    silently enter the biological fitness model.
+    """
+    raw_records = field_document_records(value)
+    if not raw_records:
+        return {}, {
+            "connected": False,
+            "active_fields": [],
+            "documents": 0,
+        }, []
+
+    candidates = {}
+    warnings = []
+    parsed_count = 0
+    for path, branch_index, item_index, item in raw_records:
+        item = resolve_rhino_value(item)
+        if item is None or not str(item).strip():
+            continue
+        try:
+            document = json.loads(str(item))
+        except Exception as exception:
+            raise ValueError(
+                "FieldDataJson %s[%d] is not valid JSON: %s"
+                % (path, item_index, exception))
+        if not isinstance(document, dict):
+            raise ValueError(
+                "FieldDataJson %s[%d] must be a JSON object."
+                % (path, item_index))
+        schema = str(document.get("schema", ""))
+        if schema != "musselflow.site_field.1.0.0":
+            raise ValueError(
+                "FieldDataJson %s[%d] has schema %r; expected "
+                "musselflow.site_field.1.0.0."
+                % (path, item_index, schema))
+        parsed_count += 1
+        variable = str(document.get("variable", "")).strip().lower()
+        canonical = FIELD_VARIABLE_MAP.get(variable)
+        if canonical is None:
+            warnings.append(
+                "Field %r is not consumed by the current fitness equations; "
+                "it was ignored." % variable)
+            continue
+        priority = 2 if variable == "satellite_chlorophyll" else 1
+        previous = candidates.get(canonical)
+        if previous is not None:
+            warnings.append(
+                "Multiple %s fields were connected; %s was selected "
+                "deterministically."
+                % (canonical,
+                   variable if priority >= previous[0] else previous[1]))
+        if previous is None or priority >= previous[0]:
+            candidates[canonical] = (priority, variable, document)
+
+    environment = {}
+    field_summaries = {}
+    obstacle_xy_m = np.asarray(obstacle_xy_m, dtype=float).reshape((-1, 2))
+    for canonical, candidate in candidates.items():
+        priority, variable, document = candidate
+        points = []
+        values = []
+        source_cells = set()
+        for record in document.get("records", []):
+            if not isinstance(record, dict):
+                continue
+            point_xy = _field_point_xy(
+                record, plane, metres_per_model_unit)
+            try:
+                raw_value = float(record.get("value"))
+            except Exception:
+                continue
+            if point_xy is None or not np.all(np.isfinite(point_xy)):
+                continue
+            if not math.isfinite(raw_value):
+                continue
+            points.append(point_xy)
+            values.append(raw_value)
+            source_cell = record.get("source_cell_id")
+            if source_cell not in (None, ""):
+                source_cells.add(str(source_cell))
+        if not points:
+            raise ValueError(
+                "FieldDataJson variable %s has no finite raw records."
+                % variable)
+        field_points = np.asarray(points, dtype=float)
+        field_values = np.asarray(values, dtype=float)
+        baseline = float(config[FIELD_BASELINE_KEYS[canonical]])
+        sampled = np.full(len(obstacle_xy_m), baseline, dtype=float)
+
+        x_min, y_min = np.min(field_points, axis=0)
+        x_max, y_max = np.max(field_points, axis=0)
+        nominal = document.get("nominal_resolution_m")
+        try:
+            nominal = float(nominal)
+            if not math.isfinite(nominal) or nominal <= 0.0:
+                nominal = 0.0
+        except Exception:
+            nominal = 0.0
+        unique_x = np.unique(np.round(field_points[:, 0], 9))
+        unique_y = np.unique(np.round(field_points[:, 1], 9))
+        spacing = []
+        if len(unique_x) > 1:
+            spacing.extend(np.diff(unique_x).tolist())
+        if len(unique_y) > 1:
+            spacing.extend(np.diff(unique_y).tolist())
+        positive_spacing = [number for number in spacing if number > 1e-9]
+        support = max(
+            [nominal*0.55] +
+            ([float(np.median(positive_spacing))*0.55]
+             if positive_spacing else [0.0]))
+
+        covered = 0
+        maximum_distance = 0.0
+        for obstacle_index, obstacle_point in enumerate(obstacle_xy_m):
+            distances_squared = np.sum(
+                (field_points-obstacle_point)**2, axis=1)
+            nearest = int(np.argmin(distances_squared))
+            distance = math.sqrt(float(distances_squared[nearest]))
+            maximum_distance = max(maximum_distance, distance)
+            inside = (
+                x_min-support <= obstacle_point[0] <= x_max+support and
+                y_min-support <= obstacle_point[1] <= y_max+support)
+            if inside:
+                sampled[obstacle_index] = field_values[nearest]
+                covered += 1
+
+        environment[canonical] = {
+            "values": sampled,
+            "metadata": {
+                "variable": variable,
+                "units": document.get("units"),
+                "time_utc": document.get("time_utc"),
+                "depth_m": document.get("depth_m"),
+                "data_source": document.get("data_source"),
+                "nominal_resolution_m": nominal or None,
+                "record_count": len(field_values),
+                "source_cell_count": len(source_cells),
+                "covered_obstacles": covered,
+                "maximum_nearest_distance_m": maximum_distance,
+            },
+        }
+        field_summaries[canonical] = environment[canonical]["metadata"]
+        if covered < len(obstacle_xy_m):
+            warnings.append(
+                "%s covered %d/%d obstacles; uncovered obstacles retained "
+                "the SimulationCaseJson baseline."
+                % (variable, covered, len(obstacle_xy_m)))
+
+    return environment, {
+        "connected": True,
+        "documents": parsed_count,
+        "active_fields": sorted(environment),
+        "fields": field_summaries,
+    }, warnings
 
 
 def curve_plane(curve, tolerance):
@@ -601,7 +819,7 @@ def named_values(mapping):
 def make_result_document(
         case, case_digest, result, scenario_items, flow_indices,
         domain_area_m2, obstacle_records, flow_records, total_ms,
-        geometry_ms, solver_ms, warnings, fidelity, descriptor_name):
+        geometry_ms, field_ms, solver_ms, warnings, fidelity, descriptor_name):
     """Build the canonical downstream Result JSON structure."""
     scenario_documents = []
     for scenario_index, scenario in enumerate(scenario_items):
@@ -644,6 +862,7 @@ def make_result_document(
             "raw_objective": result["raw_objective"],
             "timing_ms": {
                 "geometry": geometry_ms,
+                "field": field_ms,
                 "solver": solver_ms,
                 "total": total_ms,
             },
@@ -654,6 +873,8 @@ def make_result_document(
             "forcing_mode": case["forcing"]["mode"],
             "domain_area_m2": domain_area_m2,
         },
+        "environment": result["environment"],
+        "biology_trace": result["biology_trace"],
         "objectives": result["objectives"],
         "objective_weights": result["objective_weights"],
         "constraints": result["constraint_margins"],
@@ -774,7 +995,8 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             flowVectors: list[Rhino.Geometry.Vector3d],
             SimulationCaseJson: str,
             qualityMode: int,
-            speedMode: bool):
+            speedMode: bool,
+            FieldDataJson: Grasshopper.DataTree[object]):
         """
         Inputs:
             run: Evaluate the current candidate {item,bool}
@@ -789,6 +1011,9 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             qualityMode: 0 FAST or 1 REFINE {item,int}
             speedMode: True for aggressively sampled Galapagos search;
                 overrides REFINE geometry but retains full biology {item,bool}
+            FieldDataJson: Optional Site Field JSON document tree. Raw values
+                supplement SimulationCaseJson at obstacle locations
+                {tree,object}
 
         Outputs, in this exact order:
             Fitness: Scalar value for Galapagos maximization {item,float}
@@ -1042,6 +1267,17 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 "DESCRIPTOR ERROR | %s" % exception)
         geometry_ms = (time.perf_counter()-geometry_start)*1000.0
 
+        field_start = time.perf_counter()
+        try:
+            environment_fields, field_summary, field_warnings = (
+                resolve_environment_fields(
+                    FieldDataJson, plane, metres_per_model_unit,
+                    descriptors[:, :2], config))
+        except Exception as exception:
+            return empty_outputs(
+                "INVALID_CASE", "FIELD DATA ERROR | %s" % exception)
+        field_ms = (time.perf_counter()-field_start)*1000.0
+
         solver_start = time.perf_counter()
         try:
             result = optimizer_core.evaluate_layout(
@@ -1052,19 +1288,22 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 config,
                 boundary_score=boundary_value,
                 collision_score=collision_value,
-                hydraulic_profiles=hydraulic_profiles)
+                hydraulic_profiles=hydraulic_profiles,
+                environment_fields=environment_fields)
         except Exception as exception:
             return empty_outputs("SOLVER_ERROR", "SOLVER ERROR | %s" % exception)
         solver_ms = (time.perf_counter()-solver_start)*1000.0
         pre_result_ms = (time.perf_counter()-total_start)*1000.0
 
-        combined_warnings = list(warnings)+list(bridge_warnings)
+        combined_warnings = (
+            list(warnings)+list(bridge_warnings)+list(field_warnings))
         result_start = time.perf_counter()
         try:
             result_document = make_result_document(
                 case, digest, result, scenarios, flow_indices,
                 area_m2, obstacle_records, flow_records,
-                pre_result_ms, geometry_ms, solver_ms, combined_warnings,
+                pre_result_ms, geometry_ms, field_ms, solver_ms,
+                combined_warnings,
                 fidelity, descriptor_name)
             canonical_result = case_core.canonical_json(
                 json_safe(result_document))
@@ -1101,10 +1340,10 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                len(result["probe_points"]), result["probe_source"],
                len(scenarios), total_ms),
             "TIMING | setup %.3f ms | case %.3f ms (%s) | geometry %.3f ms "
-            "| solver %.3f ms | result %.3f ms"
+            "| field %.3f ms | solver %.3f ms | result %.3f ms"
             % (setup_ms, case_ms,
                "cache" if case_cache_hit else "compiled",
-               geometry_ms, solver_ms, result_ms),
+               geometry_ms, field_ms, solver_ms, result_ms),
             "FIDELITY | %s | %s"
             % (fidelity, descriptor_name),
             "UNITS | Rhino %s | 1 model unit = %.6f m"
@@ -1132,6 +1371,31 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                display_number(result["chlorophyll_capture_g_day"]),
                display_number(result["particulate_capture_kg_day"]),
                display_number(result["oxygen"]["minimum_mg_l"])),
+            "ENVIRONMENT | %s | fields %s | %d Site Field document(s)"
+            % (result["environment"]["summary"]["source"],
+               ", ".join(
+                   result["environment"]["summary"]["active_fields"])
+               or "case baselines",
+               field_summary["documents"]),
+            "BIOLOGY TRACE | %d equations | clearance %s L/h | capture %s "
+            "g chl/day | respiration %s kg O2/day | minimum DO %s mg/L"
+            % (len(result["biology_trace"]["equations"]),
+               display_number(result["biology_trace"][
+                   "active_clearance_l_h_total"]),
+               display_number(result["biology_trace"][
+                   "chlorophyll_capture_g_day"]),
+               display_number(result["biology_trace"][
+                   "mussel_respiration_kg_o2_day"]),
+               display_number(result["biology_trace"]["minimum_do_mg_l"])),
+            "BIOLOGY EVIDENCE | %d source-backed equations | %d "
+            "reduced-order balances | %d calibration proxies | %d "
+            "decision rules"
+            % (len(result["biology_trace"]["evidence"]["source_backed"]),
+               len(result["biology_trace"]["evidence"][
+                   "mechanistic_reduced_order"]),
+               len(result["biology_trace"]["evidence"][
+                   "calibration_proxies"]),
+               len(result["biology_trace"]["evidence"]["decision_logic"])),
             "FEEDING PARTITION | ingested %s | assimilated %s | faeces %s "
             "| pseudofaeces %s kg organic/day"
             % (display_number(result["ingested_organic_kg_day"]),
@@ -1144,6 +1408,9 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                display_number(result["potential_growth_g_dw_day"])),
             "SCIENTIFIC LIMIT | reduced-order descriptor/physics model; "
             "not CFD, site validation, carrying capacity, or legal evidence.",
+            "CALIBRATION LIMIT | published equation form does not establish "
+            "site accuracy; response curves and reduced-order balances need "
+            "measured or CFD calibration.",
             "HARVEST LIMIT | N/P harvest values in Result are prescribed "
             "standing-stock accounting, not predicted growth or verified "
             "eutrophication removal.",

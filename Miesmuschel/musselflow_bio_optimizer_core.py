@@ -41,6 +41,104 @@ O2_MG_PER_ML = 1.42903
 SECONDS_PER_DAY = 86400.0
 LITRES_PER_CUBIC_METRE = 1000.0
 
+ENVIRONMENT_KEYS = (
+    "chlorophyll_ug_l",
+    "tsm_mg_l",
+    "temperature_c",
+    "salinity_psu",
+    "boundary_do_mg_l",
+)
+
+# Scientific status of the numerical pathway.  This deliberately separates
+# published equations from reduced-order balances, editable response curves,
+# and the designer's optimization logic.  Executing code is testable; field
+# accuracy still requires calibration against observations or higher-fidelity
+# hydrodynamics.
+BIOLOGY_EVIDENCE = {
+    "source_backed": [
+        "clearance_allometry_mohlenberg_riisgard_1979",
+        "respiration_allometry_hamburger_et_al_1983",
+        "oxygen_solubility_garcia_gordon_1992",
+    ],
+    "mechanistic_reduced_order": [
+        "descriptor_hydraulics_and_wake_superposition",
+        "advective_capture_and_exponential_depletion",
+        "particulate_mass_partition_and_biodeposition_accounting",
+        "domain_mass_cap",
+        "one_box_oxygen_mass_balance",
+    ],
+    "calibration_proxies": [
+        "clearance_q10",
+        "respiration_q10",
+        "salinity_activity_trapezoid",
+        "particle_retention_sigmoid",
+        "low_food_and_ingestion_saturation",
+        "oxygen_activity_ramp",
+        "current_activity_curve",
+        "pseudofaeces_and_assimilation_response",
+    ],
+    "decision_logic": [
+        "normalized_weighted_objective",
+        "hard_constraint_dominance",
+    ],
+}
+
+
+def _environment_arrays(config, obstacle_count, environment_fields=None):
+    """Resolve optional per-obstacle site forcing against case baselines.
+
+    ``environment_fields`` is deliberately a numerical contract rather than a
+    Site Field JSON parser.  Grasshopper converts georeferenced field records
+    into these arrays; the solver remains independent of Rhino and JSON.
+    Missing fields retain the validated SimulationCaseJson value.
+    """
+    baselines = {
+        "chlorophyll_ug_l": config["site.chlorophyll_ug_l"],
+        "tsm_mg_l": config["site.tsm_mg_l"],
+        "temperature_c": config["site.temperature_c"],
+        "salinity_psu": config["site.salinity_psu"],
+        "boundary_do_mg_l": config["site.boundary_do_mg_l"],
+    }
+    arrays = {
+        name: np.full(obstacle_count, float(value), dtype=float)
+        for name, value in baselines.items()
+    }
+    metadata = {}
+    if environment_fields is None:
+        environment_fields = {}
+    if not isinstance(environment_fields, dict):
+        raise ValueError("environment_fields must be a dictionary or None.")
+    for name in ENVIRONMENT_KEYS:
+        if name not in environment_fields:
+            continue
+        value = environment_fields[name]
+        if isinstance(value, dict):
+            metadata[name] = dict(value.get("metadata", {}))
+            value = value.get("values")
+        array = np.asarray(value, dtype=float).reshape((-1,))
+        if array.shape != (obstacle_count,):
+            raise ValueError(
+                "environment field %s must contain one value per obstacle."
+                % name)
+        if not np.all(np.isfinite(array)):
+            raise ValueError("environment field %s contains non-finite values."
+                             % name)
+        if name in ("chlorophyll_ug_l", "tsm_mg_l", "salinity_psu",
+                    "boundary_do_mg_l") and np.any(array < 0.0):
+            raise ValueError("environment field %s cannot be negative." % name)
+        arrays[name] = array
+    active = [name for name in ENVIRONMENT_KEYS
+              if name in environment_fields]
+    summary = {
+        "active_fields": active,
+        "source": "FieldDataJson" if active else "SimulationCaseJson",
+        "ranges": {
+            name: [float(np.min(arrays[name])), float(np.max(arrays[name]))]
+            for name in ENVIRONMENT_KEYS},
+        "metadata": metadata,
+    }
+    return arrays, summary
+
 
 def oxygen_saturation_mg_l(temperature_c, salinity_psu):
     """Garcia & Gordon (1992) oxygen solubility at one atmosphere.
@@ -76,9 +174,11 @@ def lognormal_moment(mean, coefficient_of_variation, exponent):
         1.0+cv*cv)**(0.5*exponent*(exponent-1.0))
 
 
-def salinity_activity(config):
+def salinity_activity(config, salinity_psu=None):
     """Editable trapezoidal activity prior; never a universal species law."""
-    salinity = config["site.salinity_psu"]
+    salinity = (
+        config["site.salinity_psu"]
+        if salinity_psu is None else float(salinity_psu))
     zero_low = config["species.salinity_zero_low_psu"]
     full_low = config["species.salinity_full_low_psu"]
     full_high = config["species.salinity_full_high_psu"]
@@ -111,11 +211,20 @@ def particle_retention(diameter_um, config):
     return 1.0/(1.0+np.exp(-argument))
 
 
-def oxygen_activity(config):
+def oxygen_activity(config, temperature_c=None, salinity_psu=None,
+                    boundary_do_mg_l=None):
     """Reduced filtration response to boundary oxygen saturation."""
-    saturation = oxygen_saturation_mg_l(
-        config["site.temperature_c"], config["site.salinity_psu"])
-    fraction = config["site.boundary_do_mg_l"]/max(saturation, 1e-12)
+    temperature = (
+        config["site.temperature_c"]
+        if temperature_c is None else float(temperature_c))
+    salinity = (
+        config["site.salinity_psu"]
+        if salinity_psu is None else float(salinity_psu))
+    boundary_oxygen = (
+        config["site.boundary_do_mg_l"]
+        if boundary_do_mg_l is None else float(boundary_do_mg_l))
+    saturation = oxygen_saturation_mg_l(temperature, salinity)
+    fraction = boundary_oxygen/max(saturation, 1e-12)
     zero = config["species.oxygen_zero_saturation_fraction"]
     full = config["species.oxygen_full_saturation_fraction"]
     return float(np.clip((fraction-zero)/max(full-zero, 1e-12), 0.0, 1.0))
@@ -139,7 +248,9 @@ def current_activity(speed_m_s, config):
     return small_group+(1.0-small_group)*protection
 
 
-def feeding_state(chlorophyll_ug_l, tsm_mg_l, speed_m_s, config):
+def feeding_state(chlorophyll_ug_l, tsm_mg_l, speed_m_s, config,
+                  temperature_c=None, salinity_psu=None,
+                  boundary_do_mg_l=None):
     """Return transparent DEB-lite feeding multipliers for one local state."""
     small_fraction = config["food.small_particle_fraction"]
     small_retention = float(particle_retention(
@@ -159,7 +270,8 @@ def feeding_state(chlorophyll_ug_l, tsm_mg_l, speed_m_s, config):
     half_saturation = config["species.ingestion_half_saturation_ug_l"]
     saturation = half_saturation/max(
         half_saturation+float(chlorophyll_ug_l), 1e-12)
-    oxygen = oxygen_activity(config)
+    oxygen = oxygen_activity(
+        config, temperature_c, salinity_psu, boundary_do_mg_l)
     current = current_activity(speed_m_s, config)
     clearance_activity = low_food*saturation*oxygen*current
 
@@ -351,17 +463,20 @@ def _stocking(config, obstacle_count):
     return animals, dry_kg, wet_kg
 
 
-def _population_rates(config, animal_count):
+def _population_rates(config, animal_count, environment):
     """Return per-obstacle maximum clearance and respiration rates."""
     mean_dry = config["species.mean_dry_tissue_g"]
     size_cv = config["species.size_cv"]
-    salinity_factor = salinity_activity(config)
+    temperature = environment["temperature_c"]
+    salinity_factor = np.asarray([
+        salinity_activity(config, value)
+        for value in environment["salinity_psu"]], dtype=float)
     common_activity = config["species.activity_fraction"]*salinity_factor
 
     clearance_moment = lognormal_moment(
         mean_dry, size_cv, config["species.clearance_b"])
     clearance_temperature = config["species.clearance_q10"]**(
-        (config["site.temperature_c"] -
+        (temperature -
          config["species.clearance_ref_temp_c"])/10.0)
     clearance_l_h = (
         animal_count*config["species.clearance_a_l_h"]*clearance_moment *
@@ -370,7 +485,7 @@ def _population_rates(config, animal_count):
     respiration_moment = lognormal_moment(
         mean_dry, size_cv, config["species.respiration_b"])
     respiration_temperature = config["species.respiration_q10"]**(
-        (config["site.temperature_c"] -
+        (temperature -
          config["species.respiration_ref_temp_c"])/10.0)
     respiration_ml_h = (
         animal_count*config["species.respiration_a_ml_o2_h"] *
@@ -380,7 +495,7 @@ def _population_rates(config, animal_count):
 
 def _scenario(config, obstacles, probes, domain_polygon, flow_vector,
               animal_count, maximum_clearance_l_h,
-              hydraulic_profile=None):
+              hydraulic_profile=None, environment=None):
     """Evaluate one uniform-current scenario."""
     fallback = (1.0, 0.0)
     flow, speed = _normalise(flow_vector, fallback)
@@ -451,8 +566,11 @@ def _scenario(config, obstacles, probes, domain_polygon, flow_vector,
     order = np.argsort(source_u, kind="stable")
     processed = []
 
-    boundary_chlorophyll_mg_m3 = config["site.chlorophyll_ug_l"]
-    tsm_g_m3 = config["site.tsm_mg_l"]
+    if environment is None:
+        environment, unused_summary = _environment_arrays(
+            config, len(obstacles), None)
+    boundary_chlorophyll_mg_m3 = environment["chlorophyll_ug_l"]
+    tsm_g_m3 = environment["tsm_mg_l"]
     for obstacle_index in order:
         if processed:
             previous = np.asarray(processed, dtype=int)
@@ -476,11 +594,15 @@ def _scenario(config, obstacles, probes, domain_polygon, flow_vector,
         local_food[obstacle_index] = incoming
         local_particulate[obstacle_index] = particulate_incoming
 
-        local_chlorophyll = boundary_chlorophyll_mg_m3*incoming
-        local_tsm = tsm_g_m3*particulate_incoming
+        local_chlorophyll = (
+            boundary_chlorophyll_mg_m3[obstacle_index]*incoming)
+        local_tsm = tsm_g_m3[obstacle_index]*particulate_incoming
         feeding = feeding_state(
             local_chlorophyll, local_tsm,
-            speed*centre_ratio[obstacle_index], config)
+            speed*centre_ratio[obstacle_index], config,
+            environment["temperature_c"][obstacle_index],
+            environment["salinity_psu"][obstacle_index],
+            environment["boundary_do_mg_l"][obstacle_index])
         active_clearance_l_h = (
             maximum_clearance_l_h[obstacle_index] *
             feeding["clearance_activity"])
@@ -526,7 +648,7 @@ def _scenario(config, obstacles, probes, domain_polygon, flow_vector,
             effective*local_chlorophyll)
         captured_particulate_kg_day[obstacle_index] = (
             advective_flux_m3_s*particulate_removal *
-            (tsm_g_m3*particulate_incoming)*SECONDS_PER_DAY/1000.0)
+            local_tsm*SECONDS_PER_DAY/1000.0)
         processed.append(obstacle_index)
 
     probe_food = _food_at_targets(
@@ -541,10 +663,13 @@ def _scenario(config, obstacles, probes, domain_polygon, flow_vector,
     # Domain-scale mass cap: a reduced plume model must not capture more than
     # the chlorophyll or suspended mass advected through the domain section.
     domain_flux_m3_s = speed*domain_cross_width*config["site.depth_m"]
+    # A spatial field provides values at obstacle locations, not a resolved
+    # upstream boundary section.  Its mean is therefore an explicit reduced
+    # proxy for the domain inflow mass cap.
     chlorophyll_inflow_mg_s = (
-        domain_flux_m3_s*boundary_chlorophyll_mg_m3)
+        domain_flux_m3_s*float(np.mean(boundary_chlorophyll_mg_m3)))
     particulate_inflow_kg_day = (
-        domain_flux_m3_s*tsm_g_m3*SECONDS_PER_DAY/1000.0)
+        domain_flux_m3_s*float(np.mean(tsm_g_m3))*SECONDS_PER_DAY/1000.0)
     captured_chlorophyll_total = float(
         np.sum(captured_chlorophyll_mg_s))
     captured_particulate_total = float(
@@ -654,6 +779,8 @@ def _scenario(config, obstacles, probes, domain_polygon, flow_vector,
         "thrust_proxy": thrust,
         "frontal_area_m2": frontal_area,
         "frontal_fill": frontal_fill,
+        "ambient_chlorophyll_ug_l": boundary_chlorophyll_mg_m3,
+        "ambient_tsm_mg_l": tsm_g_m3,
     }
 
 
@@ -664,16 +791,19 @@ def _weighted_stack(scenarios, key, weights):
 
 def _oxygen_sequence(config, scenarios, weights, domain_area,
                      respiration_kg_o2_day,
-                     mortality_organic_kg_day):
+                     mortality_organic_kg_day, environment=None):
     """Advance a transparent one-box oxygen/deposit screening balance."""
     depth = config["site.depth_m"]
     volume = domain_area*depth
     if volume <= 0.0:
         raise ValueError("Domain water volume must be positive.")
-    saturation = oxygen_saturation_mg_l(
-        config["site.temperature_c"], config["site.salinity_psu"])
+    if environment is None:
+        environment, unused_summary = _environment_arrays(config, 1, None)
+    mean_temperature = float(np.mean(environment["temperature_c"]))
+    mean_salinity = float(np.mean(environment["salinity_psu"]))
+    saturation = oxygen_saturation_mg_l(mean_temperature, mean_salinity)
     oxygen = config["site.initial_do_mg_l"]
-    boundary_oxygen = config["site.boundary_do_mg_l"]
+    boundary_oxygen = float(np.mean(environment["boundary_do_mg_l"]))
     stock = config["sediment.initial_organic_stock_kg"]
     decay_rate = config["sediment.decay_per_day"]
     resuspension_rate = config["sediment.resuspension_per_day"]
@@ -775,6 +905,9 @@ def _oxygen_sequence(config, scenarios, weights, domain_area,
         "weighted_deposition_kg_day": weighted_deposition,
         "weighted_deposition_kg_m2_day": weighted_deposition/domain_area,
         "static_sink_kg_o2_day": static_sink_kg_day,
+        "boundary_mg_l": boundary_oxygen,
+        "temperature_c": mean_temperature,
+        "salinity_psu": mean_salinity,
     }
 
 
@@ -790,7 +923,7 @@ def _coefficient_of_variation_score(values):
 
 def evaluate_layout(obstacles, domain_polygon, probes, flow_vectors, config,
                     boundary_score=1.0, collision_score=1.0,
-                    hydraulic_profiles=None):
+                    hydraulic_profiles=None, environment_fields=None):
     """Evaluate a layout and return a deterministic screening result."""
     obstacles = np.asarray(obstacles, dtype=float)
     domain_polygon = np.asarray(domain_polygon, dtype=float)
@@ -828,17 +961,20 @@ def evaluate_layout(obstacles, domain_polygon, probes, flow_vectors, config,
             "hydraulic_profiles must contain one profile per flow vector.")
 
     config = resolved_lists(config, len(obstacles), len(flow_vectors))
+    environment, environment_summary = _environment_arrays(
+        config, len(obstacles), environment_fields)
     weights = np.asarray(config["scenario.weights"], dtype=float)
     animal_count, dry_biomass_kg, wet_biomass_kg = _stocking(
         config, len(obstacles))
     maximum_clearance_l_h, respiration_ml_h, salinity_factor = (
-        _population_rates(config, animal_count))
+        _population_rates(config, animal_count, environment))
 
     scenarios = [
         _scenario(
             config, obstacles, probes, domain_polygon, vector,
             animal_count, maximum_clearance_l_h,
-            hydraulic_profile=hydraulic_profiles[scenario_index])
+            hydraulic_profile=hydraulic_profiles[scenario_index],
+            environment=environment)
         for scenario_index, vector in enumerate(flow_vectors)
     ]
 
@@ -903,7 +1039,7 @@ def evaluate_layout(obstacles, domain_polygon, probes, flow_vectors, config,
 
     oxygen = _oxygen_sequence(
         config, scenarios, weights, domain_area, respiration_kg_o2_day,
-        mortality_organic_kg_day)
+        mortality_organic_kg_day, environment=environment)
 
     annual_survival = 1.0-config["stocking.annual_mortality_fraction"]
     harvested_wet_t_year = (
@@ -950,13 +1086,10 @@ def evaluate_layout(obstacles, domain_polygon, probes, flow_vectors, config,
         np.maximum(scope_for_growth_kj_day_by_obstacle, 0.0) /
         config["species.tissue_energy_kj_g_dw"])
 
-    maximum_clearance_m3_day = (
-        float(np.sum(maximum_clearance_l_h)) /
-        LITRES_PER_CUBIC_METRE*24.0)
-    theoretical_capture_g_day = (
-        maximum_clearance_m3_day *
+    theoretical_capture_g_day = float(np.sum(
+        maximum_clearance_l_h/LITRES_PER_CUBIC_METRE*24.0 *
         config["species.retention_efficiency"] *
-        config["site.chlorophyll_ug_l"]/1000.0)
+        environment["chlorophyll_ug_l"]/1000.0))
     target_capture = config[
         "objective.target_chlorophyll_capture_g_day"]
     if target_capture <= 0.0:
@@ -975,7 +1108,7 @@ def evaluate_layout(obstacles, domain_polygon, probes, flow_vectors, config,
         _coefficient_of_variation_score(obstacle_speed_ratio))
     oxygen_reference = max(
         config["site.initial_do_mg_l"],
-        config["site.boundary_do_mg_l"], 1e-12)
+        float(np.max(environment["boundary_do_mg_l"])), 1e-12)
     oxygen_score = float(np.clip(
         oxygen["minimum_mg_l"]/oxygen_reference, 0.0, 1.0))
     deposition_target = max(
@@ -1027,9 +1160,10 @@ def evaluate_layout(obstacles, domain_polygon, probes, flow_vectors, config,
         envelope_soft_score = min(
             envelope_soft_score,
             float(np.min(np.minimum(lower_score, upper_score))))
-    temperature = config["site.temperature_c"]
-    salinity = config["site.salinity_psu"]
-    if temperature < -2.0 or temperature > 40.0 or salinity > 42.0:
+    temperature = environment["temperature_c"]
+    salinity = environment["salinity_psu"]
+    if (np.any(temperature < -2.0) or np.any(temperature > 40.0) or
+            np.any(salinity > 42.0)):
         envelope_violations.append("oxygen_solubility")
         envelope_soft_score = min(envelope_soft_score, 0.5)
 
@@ -1121,6 +1255,14 @@ def evaluate_layout(obstacles, domain_polygon, probes, flow_vectors, config,
     warnings.append(
         "DEB-lite feeding and potential growth are transparent screening "
         "proxies, not a calibrated DEB state model or harvest forecast.")
+    if environment_summary["active_fields"]:
+        warnings.append(
+            "FieldDataJson is a static spatial snapshot in this run; values "
+            "are sampled per obstacle and reused for every current scenario.")
+        if "boundary_do_mg_l" in environment_summary["active_fields"]:
+            warnings.append(
+                "Spatial dissolved oxygen is averaged for the one-box oxygen "
+                "sequence; obstacle values still condition feeding activity.")
 
     calibration_keys = (
         "validation.geometry_calibrated",
@@ -1135,6 +1277,42 @@ def evaluate_layout(obstacles, domain_polygon, probes, flow_vectors, config,
         "CALIBRATED_WITHIN_DECLARED_ENVELOPE"
         if calibration_fraction == 1.0
         else "UNVALIDATED_SCREENING")
+
+    biology_trace = {
+        "executed": True,
+        "equations": [
+            "clearance_allometry_and_q10",
+            "salinity_activity",
+            "particle_retention",
+            "food_and_ingestion_saturation",
+            "oxygen_and_current_activity",
+            "pseudofaeces_and_assimilation_partition",
+            "advective_capture_and_domain_mass_cap",
+            "respiration_excretion_and_energy_balance",
+            "biodeposition_and_one_box_oxygen_balance",
+            "weighted_objectives_and_constraint_domination",
+        ],
+        "evidence": {
+            group: list(items) for group, items in BIOLOGY_EVIDENCE.items()
+        },
+        "validation_statement": (
+            "Source-backed equations, reduced-order balances, and editable "
+            "calibration proxies executed. This proves numerical use, not "
+            "site accuracy or external biological validation."),
+        "environment_source": environment_summary["source"],
+        "environment_fields": environment_summary["active_fields"],
+        "maximum_clearance_l_h_total": float(np.sum(maximum_clearance_l_h)),
+        "active_clearance_l_h_total": float(np.sum(
+            weighted_rates["active_clearance_l_h"])),
+        "chlorophyll_capture_g_day": capture_g_day,
+        "particulate_capture_kg_day": particulate_kg_day,
+        "pseudofaeces_organic_kg_day": pseudofaeces_kg_day,
+        "assimilated_organic_kg_day": assimilated_kg_day,
+        "mussel_respiration_kg_o2_day": respiration_kg_o2_day,
+        "minimum_do_mg_l": oxygen["minimum_mg_l"],
+        "raw_objective": raw_objective,
+        "fitness": fitness,
+    }
 
     return {
         "fitness": float(np.clip(fitness, 0.0, 1.0)),
@@ -1246,7 +1424,13 @@ def evaluate_layout(obstacles, domain_polygon, probes, flow_vectors, config,
             [scenario["frontal_area_m2"] for scenario in scenarios]),
         "scenario_frontal_fill": np.asarray(
             [scenario["frontal_fill"] for scenario in scenarios]),
-        "salinity_activity": salinity_factor,
+        "salinity_activity": float(np.mean(salinity_factor)),
+        "salinity_activity_by_obstacle": salinity_factor,
+        "environment": {
+            "summary": environment_summary,
+            "values_by_obstacle": environment,
+        },
+        "biology_trace": biology_trace,
         "calibration_fraction": calibration_fraction,
         "model_status": model_status,
         "warnings": warnings,
