@@ -12,6 +12,14 @@ rod construction:
 
 Recommended: 8 genes in each pool, all with domain 0.0 to 1.0.
 
+The control channels are deliberately independent:
+
+- U/V genes plus restart define placement, families and orientation.
+- Rod genes define the two rod dimensions per star and never move U/V points.
+
+After choosing a spatial genome, keep its U/V Gene Pools fixed and edit only
+the Rod Gene Pool to explore changing hydraulic configurations.
+
     Inputs:
         run: Expand the control genes {item,bool}
         uGenes: Eight normalized U-family controls {list,float}
@@ -76,17 +84,17 @@ def normalize(values):
     return [(value-low)/span for value in values]
 
 
-def lorenz_sequence(count, ug, vg, rg, seed):
-    """Bounded deterministic samples of a Lorenz trajectory."""
+def lorenz_sequence(count, ug, vg, seed):
+    """Bounded deterministic position samples controlled only by U/V genes."""
     sigma = remap(ug[5], 8.0, 14.0)
     rho = remap(vg[5], 22.0, 34.0)
-    beta = remap(rg[7], 2.2, 3.2)
+    beta = 8.0/3.0
     seed_u = fract(seed*0.61803398875)
     seed_v = fract(seed*0.41421356237)
     seed_z = fract(seed*0.73205080757)
     x = remap(fract(ug[0]+seed_u), -1.0, 1.0)
     y = remap(fract(vg[0]+seed_v), -1.0, 1.0)
-    z = remap(fract(rg[0]+seed_z), 0.5, 2.0)
+    z = remap(fract(0.5*(ug[0]+vg[0])+seed_z), 0.5, 2.0)
     dt = 0.008
     burn = 80
     stride = 5
@@ -148,7 +156,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
         else:
             rod_low, rod_high = 0.7, 1.2
 
-        lx, ly, lz = lorenz_sequence(star_count, ug, vg, rg, seed)
+        lx, ly, _ = lorenz_sequence(star_count, ug, vg, seed)
 
         # Family count, centres and spread are controlled by the red pools.
         family_count = 2 + int(round(4.0*0.5*(ug[4]+vg[4])))
@@ -208,22 +216,29 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 gradient_blend*gradient_v +
                 attractor_blend*ly[index]), uv_edge_exponent)
 
-            # Two related dimensions per star; downstream repeats each four times.
-            family_wave = 0.5+0.5*math.sin(
-                family_phase + radial*math.pi)
-            contrast = remap(rg[6], 0.30, 1.00)
+            # Two independent rod dimensions per star. Every rod gene is active,
+            # and none of them feeds back into U/V placement.
+            rod_phase = 2.0*math.pi*rg[4]
+            rod_frequency = 1 + int(round(4.0*rg[5]))
+            rod_wave = math.sin(
+                rod_phase + 2.0*math.pi*rod_frequency*t)
+            rod_family_count = 1 + int(round(5.0*rg[5]))
+            rod_family = index % rod_family_count
+            rod_family_wave = math.sin(
+                rod_phase + 2.0*math.pi*rod_family/rod_family_count)
+            contrast = remap(rg[6], 0.20, 1.00)
+            gradient_a = (2.0*rg[2]-1.0)*(2.0*t-1.0)
+            gradient_b = (2.0*rg[3]-1.0)*(1.0-2.0*t)
             length_a_01 = clamp(
                 rg[0] + contrast*(
-                    0.32*(2.0*family_wave-1.0)
-                    + 0.22*(2.0*t-1.0)
-                    + 0.18*(2.0*lz[index]-1.0)
-                    + 0.12*(2.0*rg[2]-1.0)))
+                    0.24*gradient_a
+                    + 0.20*rod_wave
+                    + 0.12*rod_family_wave))
             length_b_01 = clamp(
                 rg[1] + contrast*(
-                    0.32*(1.0-2.0*family_wave)
-                    + 0.22*(1.0-2.0*t)
-                    + 0.18*(2.0*lz[index]-1.0)
-                    + 0.12*(2.0*rg[3]-1.0)))
+                    0.24*gradient_b
+                    - 0.20*rod_wave
+                    - 0.12*rod_family_wave))
 
             u_values.append(u)
             v_values.append(v)
@@ -251,7 +266,7 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             du = u_values[following]-u_values[previous]
             dv = v_values[following]-v_values[previous]
             base_angle = math.degrees(math.atan2(dv, du))
-            alternating = remap(rg[6], -45.0, 45.0)
+            alternating = 45.0*(ug[6]-vg[6])
             angles.append(base_angle + alternating*(1 if index % 2 else -1))
 
         report = [
@@ -265,9 +280,9 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             % (min(u_values), max(u_values), min(v_values), max(v_values),
                min(rod_values), max(rod_values)),
             "The attractor generates geometry only; it is not the water solver.",
-            "Same genes always produce the same values, so Galapagos fitness "
-            "remains deterministic until restart is pressed.",
-            "Press restart only before starting a new Galapagos run."
+            "CHANNELS | U/V + seed control placement; rods control lengths only.",
+            "Changing Rod genes updates RodValues without moving U/V points.",
+            "Run is deterministic. Press restart only before a new spatial run."
         ]
 
         return (
