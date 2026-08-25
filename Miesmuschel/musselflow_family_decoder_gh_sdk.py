@@ -20,6 +20,10 @@ The control channels are deliberately independent:
 After choosing a spatial genome, keep its U/V Gene Pools fixed and edit only
 the Rod Gene Pool to explore changing hydraulic configurations.
 
+Rod values are mapped directly from the current Rod Gene Pool on every
+Grasshopper solution. They are never cached and are never re-normalized against
+their own population, so changing a rod gene cannot be silently cancelled out.
+
     Inputs:
         run: Expand the control genes {item,bool}
         uGenes: Eight normalized U-family controls {list,float}
@@ -44,6 +48,8 @@ import Grasshopper
 import math
 
 rc = Rhino
+
+BUILD = "2026-08-25a"
 
 
 def clamp(value, low=0.0, high=1.0):
@@ -82,6 +88,53 @@ def normalize(values):
     if span < 1e-12:
         return [0.5]*len(values)
     return [(value-low)/span for value in values]
+
+
+def values_signature(values):
+    """Stable short signature used to prove that live GH inputs were received."""
+    signature = 2166136261
+    for index, value in enumerate(values):
+        quantized = int(round(clamp(value)*1000000.0))
+        signature ^= (quantized + (index+1)*374761393) & 0xffffffff
+        signature = (signature*16777619) & 0xffffffff
+    return "%08X" % signature
+
+
+def decode_rod_values(count, genes, rod_low, rod_high):
+    """Map the current eight rod genes directly to two dimensions per star."""
+    phase = 2.0*math.pi*genes[4]
+    frequency = 1.0+4.0*genes[5]
+    amplitude = 0.10+0.32*genes[6]
+    cross_frequency = 1.0+3.0*genes[7]
+    edge_exponent_a = 1.0+0.70*genes[7]
+    edge_exponent_b = 1.0+0.70*(1.0-genes[7])
+    rod_values = []
+
+    for index in range(count):
+        t = (index+0.5)/float(count)
+        axial = 2.0*t-1.0
+        wave = math.sin(phase+2.0*math.pi*frequency*t)
+        cross_wave = math.cos(
+            0.5*phase+2.0*math.pi*cross_frequency*t)
+
+        length_a_01 = clamp(
+            genes[0] + amplitude*(
+                0.36*(2.0*genes[2]-1.0)*axial
+                + 0.42*wave
+                + 0.22*cross_wave))
+        length_b_01 = clamp(
+            genes[1] + amplitude*(
+                -0.36*(2.0*genes[3]-1.0)*axial
+                - 0.42*wave
+                + 0.22*cross_wave))
+
+        length_a_01 = edge_spread(length_a_01, edge_exponent_a)
+        length_b_01 = edge_spread(length_b_01, edge_exponent_b)
+        rod_values.extend([
+            remap(length_a_01, rod_low, rod_high),
+            remap(length_b_01, rod_low, rod_high)])
+
+    return rod_values
 
 
 def lorenz_sequence(count, ug, vg, seed):
@@ -178,8 +231,8 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
 
         u_values = []
         v_values = []
-        rod_raw_values = []
-        rod_values = []
+        rod_values = decode_rod_values(
+            star_count, rg, rod_low, rod_high)
         angles = []
         family_ids = []
 
@@ -216,48 +269,9 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
                 gradient_blend*gradient_v +
                 attractor_blend*ly[index]), uv_edge_exponent)
 
-            # Two independent rod dimensions per star. Every rod gene is active,
-            # and none of them feeds back into U/V placement.
-            rod_phase = 2.0*math.pi*rg[4]
-            rod_frequency = 1 + int(round(4.0*rg[5]))
-            rod_wave = math.sin(
-                rod_phase + 2.0*math.pi*rod_frequency*t)
-            rod_family_count = 1 + int(round(5.0*rg[5]))
-            rod_family = index % rod_family_count
-            rod_family_wave = math.sin(
-                rod_phase + 2.0*math.pi*rod_family/rod_family_count)
-            contrast = remap(rg[6], 0.20, 1.00)
-            gradient_a = (2.0*rg[2]-1.0)*(2.0*t-1.0)
-            gradient_b = (2.0*rg[3]-1.0)*(1.0-2.0*t)
-            length_a_01 = clamp(
-                rg[0] + contrast*(
-                    0.24*gradient_a
-                    + 0.20*rod_wave
-                    + 0.12*rod_family_wave))
-            length_b_01 = clamp(
-                rg[1] + contrast*(
-                    0.24*gradient_b
-                    - 0.20*rod_wave
-                    - 0.12*rod_family_wave))
-
             u_values.append(u)
             v_values.append(v)
-            rod_raw_values.extend([length_a_01, length_b_01])
             family_ids.append(family)
-
-        # Expand the actual population range before mapping to physical lengths.
-        # This retains each pattern's ordering but prevents middle-heavy rods.
-        raw_low = min(rod_raw_values)
-        raw_high = max(rod_raw_values)
-        raw_span = raw_high-raw_low
-        range_mix = remap(rg[7], 0.72, 0.94)
-        rod_edge_exponent = remap(rg[6], 1.15, 1.65)
-        for value in rod_raw_values:
-            stretched = ((value-raw_low)/raw_span
-                         if raw_span > 1e-12 else 0.5)
-            expanded = (1.0-range_mix)*value + range_mix*stretched
-            expanded = edge_spread(expanded, rod_edge_exponent)
-            rod_values.append(remap(expanded, rod_low, rod_high))
 
         # Tangent of the generated UV trajectory gives an optional orientation.
         for index in range(star_count):
@@ -270,8 +284,15 @@ class Script_Instance(Grasshopper.Kernel.GH_ScriptInstance):
             angles.append(base_angle + alternating*(1 if index % 2 else -1))
 
         report = [
-            "FAMILY DECODER | %d stars | %d families | 24 control genes | "
-            "seed %d" % (star_count, family_count, seed),
+            "FAMILY DECODER | build %s | %d stars | %d families | "
+            "seed %d" % (BUILD, star_count, family_count, seed),
+            "LIVE INPUT | U %s | V %s | ROD %s | ROD OUTPUT %s"
+            % (values_signature(ug), values_signature(vg),
+               values_signature(rg),
+               values_signature([
+                   (value-rod_low)/(rod_high-rod_low)
+                   if rod_high-rod_low > 1e-12 else 0.5
+                   for value in rod_values])),
             "Outputs: %d U + %d V + %d rod values (%d A/B pairs)."
             % (len(u_values), len(v_values), len(rod_values), star_count),
             "Blend: clusters %.2f | gradient %.2f | Lorenz-inspired %.2f"
